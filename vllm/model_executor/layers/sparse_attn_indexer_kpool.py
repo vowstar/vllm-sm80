@@ -22,7 +22,10 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+# glm53-sm80 2026-08-28: is_deep_gemm_supported() encodes both the
+# SM-arch gate (Hopper/Blackwell only) and package presence; has_deep_gemm()
+# alone would still route sm_80 into the DeepGEMM kernels and crash.
+from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -154,6 +157,77 @@ def _scatter_decode_tokens_by_request(
     )
     out[req_id, intra] = tokens
     return out
+
+
+# glm53-sm80 2026-08-28: _top_k_per_row_prefill_torch +
+# _prefill_topk_needs_torch_fallback ported from the dsv4-a100 fork
+# (model_executor/layers/sparse_attn_indexer.py). The CUDA
+# top_k_per_row_prefill kernel's histogram path (rows with more than
+# topk candidates) can leave part of its dynamic-shared-memory output
+# uninitialized and copy it out as indices; downstream, any index >= 0 is
+# treated as valid and dereferenced into the KV block table. On SM12x this
+# is upstream PR #49897; the fork reproduced it on 4x CMP 170HX (sm_80) as
+# an Xid 31 MMU fault killing a worker on prefills above ~128k tokens.
+# GLM-5.3's kpool prefill selects pools with the same kernel, so the same
+# fallback applies.
+def _top_k_per_row_prefill_torch(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """torch.topk fallback with ``top_k_per_row_prefill``'s output contract.
+
+    Select the top ``topk_tokens`` positions of ``logits[i, ks_i:ke_i)`` per
+    row, emit them relative to ``ks_i`` in ascending position order, and pad
+    rows with fewer candidates with ``-1`` (the kernel's short-row contract).
+    """
+    num_cols = logits.shape[1]
+    ks = cu_seqlen_ks.to(torch.long)[:, None]
+    cols = torch.arange(num_cols, device=logits.device)[None, :]
+    valid = (cols >= ks) & (cols < cu_seqlen_ke.to(torch.long)[:, None])
+    # logits is a per-chunk scratch buffer that is dead after top-k; mask it
+    # in place rather than materializing a masked copy.
+    logits.masked_fill_(~valid, float("-inf"))
+    k = min(topk_tokens, num_cols)
+    top_values, top_cols = logits.topk(k, dim=-1)
+    relative = (top_cols - ks).to(torch.int32)
+    # Downstream sparse-attention kernels iterate the selected KV positions in
+    # ascending order; emit position-sorted indices with the ``-1`` pads at the
+    # tail (torch.topk returns score order instead). Non-finite scores (rows
+    # shorter than ``topk_tokens``, or NaN logits) pad.
+    pad_sentinel = torch.iinfo(torch.int32).max
+    relative = torch.where(
+        top_values.isfinite(), relative, relative.new_full((), pad_sentinel)
+    )
+    relative, _ = relative.sort(dim=-1)
+    relative = torch.where(
+        relative == pad_sentinel, relative.new_full((), -1), relative
+    )
+    topk_indices[:, :k] = relative
+    if k < topk_tokens:
+        topk_indices[:, k:] = -1
+
+
+def _prefill_topk_needs_torch_fallback() -> bool:
+    """SM12x per PR #49897; SM8x added by the dsv4 fork (see above).
+
+    Set VLLM_GLM53_PREFILL_TOPK_TORCH=0 to force the CUDA kernel back on, or
+    =1 to force the fallback on any architecture.
+    """
+    import os
+
+    forced = os.environ.get("VLLM_GLM53_PREFILL_TOPK_TORCH")
+    if forced is not None:
+        return forced == "1"
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability_family(
+        120
+    ) or current_platform.has_device_capability(80) and not (
+        current_platform.has_device_capability(90)
+    )
 
 
 def _decode_topk_seq_lens(
@@ -535,11 +609,30 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
-            else:
+            elif is_deep_gemm_supported():
                 from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
+            else:
+                # glm53-sm80 2026-08-28: sm_80 Triton fallback
+                # (DeepGEMM is Hopper/Blackwell-only). Same call contract as
+                # the dsv4-a100 fork's production path.
+                from vllm.v1.attention.ops.mqa_logits_triton import (
+                    fp8_mqa_logits_triton,
+                )
+
+                assert q_scale_slice is None, (
+                    "Triton sparse-indexer fallback does not support FP4 Q"
+                )
+                logits = fp8_mqa_logits_triton(
+                    q_slice_cast,
                     (k_quant_cast, k_scale_cast),
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -571,6 +664,17 @@ def sparse_attn_indexer_kpool(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
+                    select_k,
+                )
+            elif _prefill_topk_needs_torch_fallback():
+                # glm53-sm80 2026-08-28: the CUDA kernel corrupts
+                # indices on SM8x/SM12x for rows above topk candidates
+                # (Xid 31 MMU fault downstream) — torch fallback.
+                _top_k_per_row_prefill_torch(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_dst,
                     select_k,
                 )
             else:
@@ -798,7 +902,7 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
             )
-        else:
+        elif is_deep_gemm_supported():
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
 
             logits = fp8_fp4_paged_mqa_logits(
@@ -809,6 +913,41 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
+                clean_logits=False,
+            )
+        else:
+            # glm53-sm80 2026-08-28: sm_80 Triton fallback (DeepGEMM
+            # is Hopper/Blackwell-only), same pattern as the dsv4-a100 fork.
+            # Two kpool-specific deviations from a blind fork copy:
+            # - the Triton kernel indexes context_lens as 1-D [B] and derives
+            #   per-token position as context_len - next_n + next_n_id, so a
+            #   2-D (B, next_n) seq_lens must collapse to its LAST column
+            #   (total len incl. all next_n tokens) — same handling as the
+            #   XPU branch above. Passing the 2-D tensor through would
+            #   flat-index the wrong rows under spec decode.
+            # - width the logits buffer at the ACTIVE batch max (pool units,
+            #   same coordinate system the persistent_topk call below uses),
+            #   not the full model max: at 1M ctx a [rows, max_model_len]
+            #   fp32 buffer is the indexer's largest transient. Downstream
+            #   topk reads only up to seq_lens.
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            assert padded_q_scale is None, (
+                "Triton sparse-indexer fallback does not support FP4 Q"
+            )
+            seq_lens_triton = (
+                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+            )
+            active_max_model_len = attn_metadata_narrowed.max_seq_len
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens_triton,
+                decode_metadata.block_table,
+                max_model_len=active_max_model_len,
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
@@ -961,6 +1100,7 @@ class SparseAttnIndexerKpool(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         tail_cache=None,
+        num_heads: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -974,10 +1114,52 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        # glm53-sm80 2026-08-28: on sm_80 DeepGEMM is unavailable —
+        # is_deep_gemm_supported() encodes the SM-arch + package gate.
+        # Upstream hard-raises here; downgrade to a one-time warning so the
+        # indexer routes through the Triton kernels in mqa_logits_triton.py
+        # (same pattern as the dsv4-a100 fork's sparse_attn_indexer.py).
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            assert not use_fp4_cache, (
+                "Triton sparse-indexer fallback does not support FP4 KV cache"
             )
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
+            )
+            # Prime the autotune caches (and, as a side effect of the first
+            # launch, the e4m3 decode LUT) here rather than in a warmup hook:
+            # memory profiling captures cudagraphs before any hook runs, and
+            # the autotuner's synchronizing benchmark is illegal under
+            # capture.
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_mqa_logits_triton,
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            if num_heads is None:
+                # Direct-construction tests may omit num_heads; fall back to
+                # the config's indexer head count (post-pad callers pass the
+                # padded value explicitly, which is what autotune keys on).
+                cfg = get_current_vllm_config_or_none()
+                hf = cfg.model_config.hf_config if cfg is not None else None
+                num_heads = getattr(hf, "index_n_heads", None) or 64
+            device = topk_indices_buffer.device
+            warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
+            # 64/256 are the V3.2 and V4 indexer kernel block sizes; the
+            # configured cache block size covers user-chosen values, which
+            # the backends accept as any MultipleOf(64).
+            from vllm.config import get_current_vllm_config
+
+            block_sizes = {
+                64,
+                256,
+                get_current_vllm_config().cache_config.block_size,
+            }
+            for kernel_block_size in sorted(block_sizes):
+                warmup_fp8_paged_mqa_logits_triton(
+                    num_heads, head_dim, kernel_block_size, device
+                )
 
     def forward_native(
         self,

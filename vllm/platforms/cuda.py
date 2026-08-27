@@ -153,6 +153,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+                # glm53-sm80 2026-08-28: last-resort sparse MLA
+                # backend. The three above are all gated sm_90+, so on
+                # sm_80 (A100/CMP 170HX) this pure-Triton backend is the
+                # only one that passes validation; on sm_90 it stays last
+                # and never wins over the native kernels.
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
             if prefer_fi_sm90:
                 sparse_tail.pop()  # dedupe the head entry
