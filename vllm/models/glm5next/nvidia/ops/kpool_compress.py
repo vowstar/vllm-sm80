@@ -16,6 +16,15 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# glm53-sm80 2026-08-28: Triton below SM89 cannot emit fp8e4nv
+# converts, which made every FP8 store in this file fail to compile on
+# sm_80 ("type fp8e4nv not supported in this architecture", first hit in
+# fwht128_quant_fp8 at GLM-5.3 startup). All FP8 stores now go through
+# _encode_e4m3fn_u8 over uint8 pointer views: hardware convert where
+# supported, bit-exact software RNE encoder on sm_80. Numerics unchanged
+# on sm_90+ (the encoder's native branch is the same instruction).
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
 
@@ -101,7 +110,11 @@ def _fwht_quant_kernel(
     scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
-    tl.store(qout_ptr + rows[:, None] * 128 + offs[None, :], y, mask=rmask[:, None])
+    tl.store(
+        qout_ptr + rows[:, None] * 128 + offs[None, :],
+        _encode_e4m3fn_u8(y),  # glm53-sm80 2026-08-28
+        mask=rmask[:, None],
+    )
     tl.store(sout_ptr + rows, scale, mask=rmask)
 
 
@@ -127,7 +140,10 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    # glm53-sm80 2026-08-28: uint8 pointer view (see header note).
+    _fwht_quant_kernel[grid](
+        q, q_fp8.view(torch.uint8), q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2
+    )
     return q_fp8, q_scale
 
 
@@ -243,13 +259,17 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + S_OFFSET_NBYTES_IN_PAGE // 4
             + loc_token_offset_in_page
         )
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(
+            buf_fp8_ptr + out_k_offsets,
+            _encode_e4m3fn_u8(quantized),  # glm53-sm80 2026-08-28
+            mask=mask,
+        )
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
 
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            _encode_e4m3fn_u8(quantized),  # glm53-sm80 2026-08-28
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -314,7 +334,8 @@ def kpool_compress_and_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # glm53-sm80 2026-08-28: uint8 pointer view (see header note).
+    buf_fp8 = buf
     buf_fp32 = buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
     buf_numel_per_page = buf.stride(0)
@@ -332,6 +353,14 @@ def kpool_compress_and_write_cache(
     else:
         compressed_k = buf_fp8
         compressed_scale = buf_fp32
+    # glm53-sm80 2026-08-28: uint8 pointer view for the LAUNCH
+    # only (see header note) — the RETURNED tensor must keep the fp8 dtype,
+    # rebinding compressed_k itself made callers read raw bytes as values.
+    compressed_k_u8 = (
+        compressed_k
+        if compressed_k.dtype == torch.uint8
+        else compressed_k.view(torch.uint8)
+    )
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
         buf_fp8,
@@ -341,7 +370,7 @@ def kpool_compress_and_write_cache(
         ape,
         loc,
         write_mask,
-        compressed_k,
+        compressed_k_u8,
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -589,7 +618,11 @@ def _kpool_decode_update_batched_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(
+                buf_fp8_ptr + out_k_offsets,
+                _encode_e4m3fn_u8(quantized),  # glm53-sm80 2026-08-28
+                mask=dim_mask,
+            )
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
         # Stash the current token AFTER any completion read so the completion
@@ -662,7 +695,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     page_size = kv_cache.shape[1]
     buf = kv_cache
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # glm53-sm80 2026-08-28: uint8 pointer view (see header note).
+    buf_fp8 = buf
     buf_fp32 = buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
