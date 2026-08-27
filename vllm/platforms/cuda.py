@@ -153,13 +153,17 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
-                # glm53-sm80 2026-08-28: last-resort sparse MLA
-                # backend. The three above are all gated sm_90+, so on
-                # sm_80 (A100/CMP 170HX) this pure-Triton backend is the
-                # only one that passes validation; on sm_90 it stays last
-                # and never wins over the native kernels.
-                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
+            # glm53-sm80 2026-08-28: last-resort sparse MLA backend.
+            # The three in sparse_tail are all gated sm_90+, so on sm_80
+            # (A100/CMP 170HX) this pure-Triton backend is the only one that
+            # passes validation; on sm_90 it stays last and never wins over
+            # the native kernels. Appended at the RETURN sites, NOT inside
+            # sparse_tail: the prefer_fi_sm90 branch below does
+            # sparse_tail.pop() assuming FLASHINFER_MLA_SPARSE_SM90 is the
+            # last entry — appending inside the list made the pop remove
+            # TRITON_MLA_SPARSE instead (first GLM PP5 launch attempt died
+            # with "No valid attention backend found").
             if prefer_fi_sm90:
                 sparse_tail.pop()  # dedupe the head entry
                 return [
@@ -169,6 +173,7 @@ def _get_backend_priorities(
                     AttentionBackendEnum.TRITON_MLA,
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
                     *sparse_tail,
+                    AttentionBackendEnum.TRITON_MLA_SPARSE,
                 ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
@@ -176,6 +181,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 *sparse_tail,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
