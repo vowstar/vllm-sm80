@@ -21,6 +21,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -207,7 +208,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         )
 
 
-class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -322,6 +323,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+
+            # glm53-sm80 2026-08-28: under PP the MTP draft lives on
+            # the last rank, while the target embedding lives on the first.
+            # The checkpoint stores only the top-level tied embedding (not a
+            # layer-45 copy), so the spec-layer filter below would skip it and
+            # leave this draft's embed_tokens uninitialized.  This is the GLM
+            # form of vllm#46994's own-embedding fix.
+            if "embed_tokens" in name:
+                param = params_dict.get(name)
+                if param is not None:
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is not None:
+                        weight_loader(param, loaded_weight)
+                    else:
+                        param.data.copy_(loaded_weight)
+                    loaded_params.add(name)
+                continue
+
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -413,6 +432,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             loaded_params.add(name)
 
         loaded_layers: set[int] = set()
+        draft_embed_params = {
+            name for name in params_dict if name.endswith("embed_tokens.weight")
+        }
+        if draft_embed_params and draft_embed_params.isdisjoint(loaded_params):
+            raise ValueError(
+                "MTP draft embed_tokens was not loaded from the tied checkpoint "
+                "embedding; PP decoding would use uninitialized weights."
+            )
         for param_name in loaded_params:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
             if spec_layer is not None:

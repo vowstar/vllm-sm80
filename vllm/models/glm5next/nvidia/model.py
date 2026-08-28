@@ -445,6 +445,9 @@ class Glm5NextDecoderLayer(nn.Module):
         x = hidden_states
         if post is None:
             if self.layer_idx == 0:
+                # The model-wide first layer initializes the mHC streams.
+                # PP boundaries carry residual/post/comb explicitly below;
+                # rebuilding them would change the target-model computation.
                 x = hc_expand(x, self.n)
             residual = x
             post, comb, x = self.hc_pre(
@@ -663,6 +666,39 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    # glm53-sm80 2026-08-28: enable exact PP for mHC by carrying the
+    # deferred hc_post state across pipeline boundaries. Dropping these tensors
+    # and rebuilding streams with hc_expand changes the model computation.
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        n = self.config.mhc_num_residual_streams
+        hidden_size = self.config.hidden_size
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+                "residual": torch.zeros(
+                    (batch_size, n, hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+                "post": torch.zeros(
+                    (batch_size, n, 1),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "comb": torch.zeros(
+                    (batch_size, n, n),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -683,10 +719,8 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            post = intermediate_tensors["post"]
+            comb = intermediate_tensors["comb"]
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
@@ -698,13 +732,14 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
+            assert residual is not None and post is not None and comb is not None
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "post": post,
+                    "comb": comb,
+                }
             )
 
         if self.is_sequence_parallel:
@@ -903,6 +938,14 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    # glm53-sm80 2026-08-28: PP enable, delegate to the decoder.
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return self.model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1046,9 +1089,14 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        # glm53-sm80 2026-08-28: PP enable, delegate to language_model.
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return self.language_model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding

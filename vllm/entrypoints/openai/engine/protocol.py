@@ -99,6 +99,9 @@ class ModelCard(OpenAIBaseModel):
     root: str | None = None
     parent: str | None = None
     max_model_len: int | None = None
+    # glm53-sm80 2026-08-28: DSH only discovers the OpenAI-style
+    # context_window/context_length spellings, not vLLM's max_model_len.
+    context_window: int | None = None
     permission: list[ModelPermission] = Field(default_factory=list)
 
 

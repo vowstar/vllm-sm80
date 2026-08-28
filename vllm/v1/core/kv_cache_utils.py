@@ -182,6 +182,15 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # apcfix 2026-08-27 (vllm#42948 family): reuse provenance for
+    # BlockPool's tiered free queues. `apcfix_hit` records that the currently
+    # cached content has served at least one prefix-cache hit; it is reset
+    # together with the hash. `apcfix_q` tracks which free queue holds the
+    # block (0 = not queued, 1 = uncached, 2 = cached-never-hit, 3 = cached
+    # hit-proven); only BlockPool maintains it.
+    apcfix_hit: bool = False
+    apcfix_q: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -205,6 +214,9 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        # apcfix: the hit credit belongs to the cached content,
+        # not to the physical block; it dies with the hash entry.
+        self.apcfix_hit = False
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

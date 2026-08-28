@@ -44,6 +44,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.triton_utils import tl, triton
 
+# glm53-sm80 2026-08-28: sm_80 has no native fp8e4nv convert.
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+
 logger = init_logger(__name__)
 
 
@@ -85,6 +88,7 @@ def fused_moe_nvfp4_emulation_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     group_size: tl.constexpr,
+    W_GLOBAL_SCALE_TWO: tl.constexpr,
 ):
     """
     Fused MoE kernel for emulated NVFP4 weight-only dequantization + GEMM.
@@ -93,7 +97,8 @@ def fused_moe_nvfp4_emulation_kernel(
     Weights B are packed uint8 NVFP4 [E, N, K//2] — two FP4 values per byte
     along the K dimension.
     B_scale holds per-block FP8-E4M3 scales [E, N, K // group_size].
-    w_global_scale is a per-expert scalar global scale.
+    w_global_scale is either one scalar per expert or two scalars per expert
+    for the fused gate/up halves of w13.
 
     The dequantization formula per element is:
         w_float = e2m1_decode(nibble) * (block_scale_fp8 * global_scale)
@@ -172,8 +177,16 @@ def fused_moe_nvfp4_emulation_kernel(
     # scale indices the same way unpacked indices map via group_size.
     group_size_packed: tl.constexpr = group_size // 2
 
-    # Load per-expert global scale (scalar).
-    w_global_scale = tl.load(w_global_scale_ptr + off_experts).to(tl.float32)
+    # Load the per-expert global scale. ModelOpt checkpoints may carry
+    # different global scales for the fused gate and up projections.
+    if W_GLOBAL_SCALE_TWO:
+        w_global_scale = tl.load(
+            w_global_scale_ptr
+            + off_experts * 2
+            + (offs_bn >= N // 2).to(tl.int64)
+        ).to(tl.float32)
+    else:
+        w_global_scale = tl.load(w_global_scale_ptr + off_experts).to(tl.float32)
 
     # K-loop with FP32 accumulation
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -222,8 +235,12 @@ def fused_moe_nvfp4_emulation_kernel(
         else:
             b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
 
-        b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(tl.float32)
-        b_scale = b_scale * w_global_scale
+        # glm53-sm80: sm_80 has no native fp8e4nv.
+        b_scale = _decode_fp8_f32(b_scale_raw, False)
+        if W_GLOBAL_SCALE_TWO:
+            b_scale = b_scale * w_global_scale[:, None]
+        else:
+            b_scale = b_scale * w_global_scale
 
         # Scale both halves with the same per-block scale (the two
         # elements packed in one byte always belong to the same group).
@@ -274,9 +291,17 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
 
     B has shape [E, N, K_packed] where K_packed = K // 2 (two FP4 per byte).
     B_scale has shape [E, N, K // group_size] in FP8-E4M3 (stored as uint8).
-    w_global_scale has shape [E] (per-expert scalar).
+    w_global_scale has shape [E] (one scalar per expert) or [E, 2]
+    (distinct gate/up scalars for fused w13).
     """
     assert B_scale is not None and B_scale.ndim == 3
+    assert w_global_scale.ndim in (1, 2)
+    if w_global_scale.ndim == 2:
+        assert w_global_scale.size(1) == 2
+        assert B.size(1) % 2 == 0
+    # glm53-sm80 2026-08-28: Triton cannot bind an fp8 pointer on
+    # sm_80 (kernel def line raises); always pass the raw bytes.
+    B_scale = B_scale.view(torch.uint8)
 
     N = B.size(1)
     K = A.size(1)
@@ -326,6 +351,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         top_k=top_k,
         compute_type=compute_type,
         group_size=16,
+        W_GLOBAL_SCALE_TWO=w_global_scale.ndim == 2,
         BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
@@ -366,14 +392,15 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
-        return "nvfp4"
+        # W4A4 uses NVFP4 activation QDQ; W4A16 has no activation quantizer.
+        return self.quant_config.quant_dtype
 
     @property
     def expects_unquantized_inputs(self) -> bool:
         return True
 
     @property
-    def a1_scale(self) -> torch.Tensor:
+    def a1_scale(self) -> torch.Tensor | None:
         # Used in experts/triton_moe.py and passed to moe_kernel_quantize_input.
         return self.a1_gscale
 
@@ -407,7 +434,10 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)
+        return weight_key == kNvfp4Static and activation_key in (
+            kNvfp4Dynamic,
+            None,
+        )
 
     def apply(
         self,
@@ -486,14 +516,18 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
             expert_map,
         )
 
-        # Activation NVFP4 QDQ.
-        hidden_states_qdq, _ = moe_kernel_quantize_input(
-            A=hidden_states,
-            A_scale=self.quant_config.a1_gscale,
-            quant_dtype="nvfp4",
-            per_act_token_quant=False,
-            quantization_emulation=True,
-        )
+        # W4A4 emulation applies activation QDQ. Weight-only W4A16 has no
+        # activation scale and must preserve BF16/FP16 activations exactly.
+        if self.quant_config.a1_gscale is None:
+            hidden_states_qdq = hidden_states
+        else:
+            hidden_states_qdq, _ = moe_kernel_quantize_input(
+                A=hidden_states,
+                A_scale=self.quant_config.a1_gscale,
+                quant_dtype="nvfp4",
+                per_act_token_quant=False,
+                quantization_emulation=True,
+            )
 
         # w13: fused weight dequant + GEMM.
         invoke_fused_moe_nvfp4_emulation_kernel(
@@ -517,14 +551,16 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
 
-        # Activation NVFP4 QDQ.
-        intermediate_cache2_qdq, _ = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=self.quant_config.a2_gscale,
-            quant_dtype="nvfp4",
-            per_act_token_quant=False,
-            quantization_emulation=True,
-        )
+        if self.quant_config.a2_gscale is None:
+            intermediate_cache2_qdq = intermediate_cache2
+        else:
+            intermediate_cache2_qdq, _ = moe_kernel_quantize_input(
+                A=intermediate_cache2,
+                A_scale=self.quant_config.a2_gscale,
+                quant_dtype="nvfp4",
+                per_act_token_quant=False,
+                quantization_emulation=True,
+            )
 
         # w2: fused weight dequant + GEMM.
         invoke_fused_moe_nvfp4_emulation_kernel(

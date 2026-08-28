@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -1079,6 +1080,32 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptNvFp4Config":
+        # glm53-sm80 2026-08-28: compressed-tensors configs describe
+        # activation quantization explicitly. An NVFP4 weight scheme with
+        # input_activations=null is W4A16 even if an older producer labels
+        # quant_algo simply NVFP4.
+        if quant_method == "NVFP4":
+            config_groups = original_config.get("config_groups")
+            if isinstance(config_groups, dict):
+                fp4_groups = [
+                    group
+                    for group in config_groups.values()
+                    if isinstance(group, dict)
+                    and isinstance(group.get("weights"), dict)
+                    and group["weights"].get("type") == "float"
+                    and group["weights"].get("num_bits") == 4
+                ]
+                if fp4_groups and all(
+                    "input_activations" in group
+                    and group["input_activations"] is None
+                    for group in fp4_groups
+                ):
+                    quant_method = "W4A16_NVFP4"
+                    logger.info_once(
+                        "Detected weight-only NVFP4 config "
+                        "(input_activations=null); using W4A16_NVFP4."
+                    )
+
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
         if group_size is None:
@@ -1520,39 +1547,48 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        global_sf_num_experts = (
-            global_num_experts if self.use_global_sf else num_experts
-        )
-        w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
-                global_sf_num_experts,
-                w13_num_shards,
-                dtype=torch.float32,
-            ),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w13_input_scale", w13_input_scale)
+        if not self.use_a16:
+            global_sf_num_experts = (
+                global_num_experts if self.use_global_sf else num_experts
+            )
+            w13_input_scale = PerTensorScaleParameter(
+                data=torch.empty(
+                    global_sf_num_experts,
+                    w13_num_shards,
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
 
-        w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
+            w2_input_scale = PerTensorScaleParameter(
+                data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
 
-        # Use a single gscale for w13.
-        if self.moe.is_act_and_mul and not torch.allclose(
-            layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+        # glm53-sm80 2026-08-28: the emulation kernel can apply the
+        # checkpoint's distinct gate/up global scales to the two fused w13
+        # output halves. Other backends still require one scalar per expert.
+        if (
+            self.moe.is_act_and_mul
+            and self.nvfp4_backend == NvFp4MoeBackend.EMULATION
         ):
-            logger.warning_once(
-                "w1_weight_scale_2 must match w3_weight_scale_2. "
-                "Accuracy may be affected."
-            )
-        w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+            w13_weight_scale_2 = layer.w13_weight_scale_2.contiguous()
+        else:
+            if self.moe.is_act_and_mul and not torch.allclose(
+                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+            ):
+                logger.warning_once(
+                    "w1_weight_scale_2 must match w3_weight_scale_2. "
+                    "Accuracy may be affected."
+                )
+            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 
         (
             w13,
@@ -1569,11 +1605,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w13=layer.w13_weight,
             w13_scale=layer.w13_weight_scale,
             w13_scale_2=w13_weight_scale_2,
-            a13_scale=layer.w13_input_scale,
+            a13_scale=getattr(layer, "w13_input_scale", None),
             w2=layer.w2_weight,
             w2_scale=layer.w2_weight_scale,
             w2_scale_2=layer.w2_weight_scale_2,
-            a2_scale=layer.w2_input_scale,
+            a2_scale=getattr(layer, "w2_input_scale", None),
             is_act_and_mul=self.moe.is_act_and_mul,
             use_a16=self.use_a16,
         )
@@ -1581,11 +1617,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
-        replace_parameter(layer, "w13_input_scale", a13_scale)
+        if a13_scale is not None:
+            replace_parameter(layer, "w13_input_scale", a13_scale)
         replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-        replace_parameter(layer, "w2_input_scale", a2_scale)
+        if a2_scale is not None:
+            replace_parameter(layer, "w2_input_scale", a2_scale)
 
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -1606,8 +1644,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
             w13_scale_2=layer.w13_weight_scale_2,
             w2_scale_2=layer.w2_weight_scale_2,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
+            a13_scale=getattr(layer, "w13_input_scale", None),
+            a2_scale=getattr(layer, "w2_input_scale", None),
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             swiglu_alpha=getattr(layer, "swiglu_alpha", None),
             swiglu_beta=getattr(layer, "swiglu_beta", None),

@@ -332,13 +332,20 @@ def _compute_slot_mappings_kernel(
 
         block_indices = local_positions // kernel_block_size
         block_offsets = local_positions % kernel_block_size
+        # Narrow side caches (for example GLM-5.3 KpoolTailSpec) have a
+        # one-block block table even though positions are raw model-token
+        # positions. Their metadata builder replaces this generic mapping with
+        # a circular one, but the generic kernel must not read outside the row
+        # before that happens. See vllm-project/vllm#53982.
+        token_valid = offset < end_idx
+        in_range = (block_indices >= 0) & (block_indices < block_table_stride)
+        mapping_valid = token_valid & is_local & in_range
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=mapping_valid,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
-        if CP_SIZE != 1:
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_valid, slot_ids, PAD_ID)
 
-        tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+        tl.store(slot_mapping_ptr + offset, slot_ids, mask=token_valid)

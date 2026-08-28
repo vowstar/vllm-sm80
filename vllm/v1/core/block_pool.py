@@ -175,10 +175,20 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # apcfix 2026-08-27 (vllm#42948 family):
+        # Split free blocks into three tiers. Allocation draws uncached first,
+        # then cached-never-hit, then cached-hit-proven, so live cache entries
+        # are destroyed only at genuine pool pressure and proven-hot prefixes
+        # are sacrificed last.
+        #
+        # Keep the cold cached tier under the historical `free_block_queue`
+        # name because simple KV offload walks that queue for eviction
+        # candidates.
+        self.free_queue_uncached = FreeKVCacheBlockQueue(self.blocks)
+        for block in self.blocks:
+            block.apcfix_q = 1
+        self.free_block_queue = FreeKVCacheBlockQueue([])
+        self.free_queue_hot = FreeKVCacheBlockQueue([])
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -187,13 +197,42 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = self.free_queue_uncached.popleft()
+        self.null_block.apcfix_q = 0
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def _popleft_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop raw free blocks in tier order, without refcount handling."""
+        ret: list[KVCacheBlock] = []
+        remaining = num_blocks
+        for queue in (
+            self.free_queue_uncached,
+            self.free_block_queue,
+            self.free_queue_hot,
+        ):
+            if remaining == 0:
+                break
+            take = min(remaining, queue.num_free_blocks)
+            if take > 0:
+                ret.extend(queue.popleft_n(take))
+                remaining -= take
+        for block in ret:
+            block.apcfix_q = 0
+        return ret
+
+    def _apcfix_queue_for(self, block: KVCacheBlock) -> FreeKVCacheBlockQueue:
+        """Return the free queue currently holding ``block``."""
+        if block.apcfix_q == 1:
+            return self.free_queue_uncached
+        if block.apcfix_q == 3:
+            return self.free_queue_hot
+        # 2 (and any unexpected value) lives in the cold cached queue.
+        return self.free_block_queue
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,7 +697,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = self._popleft_free_blocks(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -708,11 +747,16 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
+            # ref_cnt=0 means this block is in a free queue (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                self._apcfix_queue_for(block).remove(block)
+                block.apcfix_q = 0
             block.ref_cnt += 1
+            if not block.is_null:
+                # A touch is a proven prefix-cache hit, so this content
+                # re-enters the hit-proven tier on its next free.
+                block.apcfix_hit = True
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -725,22 +769,30 @@ class BlockPool:
                 priority.
         """
         # Identify blocks with hash (LRU cache) and without it (never match APC)
-        blocks_to_evict_last = []
-        blocks_to_evict_first = []
+        blocks_to_evict_last: list[KVCacheBlock] = []
+        blocks_hot: list[KVCacheBlock] = []
+        blocks_to_evict_first: list[KVCacheBlock] = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif block.apcfix_hit:
+                    blocks_hot.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
-        # Blocks to reuse first are prepended to the front of the free queue.
-        self.free_block_queue.prepend_n(blocks_to_evict_first)
-        # Blocks to reuse last are appended to the end of the free queue.
+        for block in blocks_to_evict_first:
+            block.apcfix_q = 1
+        self.free_queue_uncached.prepend_n(blocks_to_evict_first)
+        for block in blocks_to_evict_last:
+            block.apcfix_q = 2
         self.free_block_queue.append_n(blocks_to_evict_last)
+        for block in blocks_hot:
+            block.apcfix_q = 3
+        self.free_queue_hot.append_n(blocks_hot)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -803,7 +855,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_queue_uncached.num_free_blocks
+            + self.free_block_queue.num_free_blocks
+            + self.free_queue_hot.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

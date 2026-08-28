@@ -8,6 +8,10 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
+# glm53-sm80 2026-08-28: sm_80 has no native fp8e4nv convert; the
+# sm_80-proven helpers auto-select native casts where available.
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_e4m3fn_u8
+
 __all__ = [
     "break_fp4_bytes",
     "dequantize_to_dtype",
@@ -85,7 +89,7 @@ def _dequantize_nvfp4_kernel(
         mask=block_mask,
         other=0,
     )
-    scale_f32 = tl.cast(raw_scales, tl.float8e4nv, bitcast=True).to(tl.float32)
+    scale_f32 = _decode_fp8_f32(raw_scales, False)  # glm53-sm80: sm_80 has no native fp8e4nv
     scale_values = (scale_f32 * global_scale)[:, None]
 
     # Load [TILE_BLOCKS, BLOCK_PACKED] packed bytes
@@ -173,7 +177,7 @@ def _nvfp4_quant_dequant_kernel(
     vec_max = tl.max(tl.abs(x), axis=1)
     scale = global_scale * (vec_max * FP4_MAX_RECIPROCAL)
     scale = tl.clamp(scale, -448.0, 448.0)
-    scale = scale.to(tl.float8e4nv).to(tl.float32)
+    scale = _decode_fp8_f32(_encode_e4m3fn_u8(scale), False)  # glm53-sm80: bit-exact e4m3 round-trip
 
     # Safe reciprocal, broadcast to [TILE_BLOCKS, 1]
     output_scale = tl.where(scale == 0.0, 0.0, global_scale / scale)[:, None]

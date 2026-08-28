@@ -210,6 +210,9 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
+        # glm53-sm80 2026-08-28: keep the Indexer itself because MTP
+        # sharing replaces its buffer after backend construction (vllm#46994).
+        self._indexer = indexer
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).
@@ -259,8 +262,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         num_actual_toks = q.shape[0]
 
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        buf = (
+            self._indexer.topk_indices_buffer
+            if self._indexer is not None
+            else self.topk_indices_buffer
+        )
+        assert buf is not None, "topk_indices_buffer required for sparse MLA"
+        topk_indices = buf[:num_actual_toks]
 
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
@@ -271,7 +279,12 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            # glm53-sm80 2026-08-28: GLM pads the topk buffer
+            # (index_topk + kpool-1 tail, rounded up to 128) and the indexer
+            # fills the whole width with -1 each forward, so padded columns
+            # are masked. Convert the physical width; no-op for DeepSeek,
+            # whose buffer is exactly topk_tokens wide.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
