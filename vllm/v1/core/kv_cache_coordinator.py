@@ -900,6 +900,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        # glm53-sm80 2026-08-28 APCDIAG: per-group hit visibility
+        import os as _os
+        if _os.environ.get("VLLM_APC_DIAG", "0") == "1" and max_cache_hit_length > 50000:
+            logger.warning(
+                "APCDIAG hit: max=%d final=%d uncached=%d groups=%s",
+                max_cache_hit_length, hit_length,
+                num_uncached_common_prefix_tokens,
+                [hit_length_by_group[i] if hit_blocks_by_group[i] is not None
+                 else -1 for i in range(num_groups)])
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

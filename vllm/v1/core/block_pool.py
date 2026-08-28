@@ -731,6 +731,16 @@ class BlockPool:
             self.metrics_collector.on_block_evicted(block)
 
         evicted_hashes = self._remove_cached_block_hashes(block)
+        # glm53-sm80 2026-08-28 APCDIAG: count hash evictions
+        import os as _os
+        if evicted_hashes and _os.environ.get("VLLM_APC_DIAG", "0") == "1":
+            BlockPool._apcdiag_evict_count = (
+                getattr(BlockPool, "_apcdiag_evict_count", 0) + 1)
+            n = BlockPool._apcdiag_evict_count
+            if n <= 20 or n % 200 == 0:
+                logger.warning(
+                    "APCDIAG evict #%d: block removed %d hash(es), q=%d",
+                    n, len(evicted_hashes), getattr(block, "apcfix_q", -1))
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
