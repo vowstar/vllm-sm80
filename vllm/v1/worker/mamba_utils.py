@@ -1550,8 +1550,18 @@ def postprocess_mamba_align_gpu(
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
     # when src_block_idx == dest_block_idx (copy within the same block), so
     # the original count is preserved for everyone else.
+    # glm53-sm80 2026-08-29: blocking copy, not non_blocking.
+    # The async D2H landed in the previous step's row order with no event
+    # awaiting it, while InputBatch row moves (condense/swap) permute the
+    # same pinned buffer and the next preprocess reads it by the new row
+    # order: under async scheduling a request could pick up another
+    # request's accepted count and resume its KDA state at the wrong token
+    # bias (upstream issue #51571, silent corruption; the open PRs #51599 and
+    # #53919 only patch the legacy gpu_model_runner.py, not this path).
+    # The copy is num_reqs ints after the fused postprocess kernel, so the
+    # sync costs tens of microseconds per decode step.
     num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=False
     )
 
 
