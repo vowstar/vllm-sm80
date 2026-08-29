@@ -133,8 +133,17 @@ def _sparse_mla_compute_tile(
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
 
+        # glm53-sm80 2026-08-29: widen address math to int64.
+        # With a 918-block x 4608-row pool and stride_kv_token=512, rows
+        # >= 2**31/512 (= 4,194,304, i.e. physical blocks 910+) overflow
+        # int32 and wrap negative — they pass mask_kv (which tests the
+        # index, not the offset) and load wild addresses (rank0 IMA in
+        # production on a dirty pool). Same latent bug exists upstream
+        # (#38476/#47629 kernels are arithmetically identical).
+        idx64 = indices.to(tl.int64)
+
         offs_k = (
-            indices[None, :] * stride_kv_token
+            idx64[None, :] * stride_kv_token
             + cur_kv_head_id * stride_kv_head
             + offs_d[:, None]
         )
@@ -145,7 +154,7 @@ def _sparse_mla_compute_tile(
         # entirely when BLOCK_DPE == 0 (see above).
         if BLOCK_DPE > 0:
             offs_kpe = (
-                indices[None, :] * stride_kv_token
+                idx64[None, :] * stride_kv_token
                 + cur_kv_head_id * stride_kv_head
                 + offs_dpe[:, None]
             )
@@ -160,7 +169,7 @@ def _sparse_mla_compute_tile(
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
 
         offs_v = (
-            indices[:, None] * stride_kv_token
+            idx64[:, None] * stride_kv_token
             + cur_kv_head_id * stride_kv_head
             + offs_dv[None, :]
         )
