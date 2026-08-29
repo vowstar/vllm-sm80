@@ -30,7 +30,7 @@ Measured on 2026-08-28 and 2026-08-29, 5x CMP 170HX, PP5 partition 11,9,9,9,7, M
 | Sparse MLA attention | Triton kernel port for sm_80. NoPE path. Indexer Triton fallback. |
 | FP8 KV stores | Software e4m3fn encoding on sm_80 |
 | NVFP4 MoE | W4A16 path. Marlin repack holdoff. Fused Triton emulation kernel. |
-| Prefix caching | Port of #53479. Port of #53962. Tiered free queue eviction policy. Env gated diagnostics (APCDIAG). |
+| Prefix caching | Port of #53479. Port of #53962. Tiered free queue eviction policy with a bounded hit-proven tier. Env gated diagnostics (APCDIAG). |
 | Sparse MLA kernel | int64 fix for KV pools above 4,194,304 rows |
 | Mamba align postprocess | Blocking D2H copy for the accepted count |
 
@@ -73,6 +73,7 @@ docker run -d --name glm53 --runtime=nvidia \
 | --- | --- |
 | KDA numerics | The KDA path deviates about 7 percent from the reference in some tests |
 | KV capacity | Mamba state pages alias into larger blocks. About 10 MB per block stays idle. Effective capacity is lower than the raw pool size suggests. |
+| Hot tier cap | The hit-proven eviction tier demotes its oldest entries above 50 percent of the pool. Set VLLM_APC_HOT_CAP_PCT=0 for the unbounded behavior. |
 
 ## Attribution
 
