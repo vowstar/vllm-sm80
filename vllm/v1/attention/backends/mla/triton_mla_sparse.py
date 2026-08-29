@@ -110,6 +110,10 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         attn_metadata: XPUMLASparseMetadata,
         layer: AttentionLayer,
     ) -> torch.Tensor:
+        # The spec allocates fp8 caches as float8_e4m3fn; the kernel
+        # needs uint8 bytes (sm_80 Triton rejects fp8 pointer types).
+        if kv_c_and_k_pe_cache.dtype != torch.uint8:
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(torch.uint8)
         num_tokens = q.shape[0]
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
