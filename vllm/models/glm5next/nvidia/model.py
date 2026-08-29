@@ -666,7 +666,7 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    # glm53-sm80 2026-08-28: enable exact PP for mHC by carrying the
+    # enable exact PP for mHC by carrying the
     # deferred hc_post state across pipeline boundaries. Dropping these tensors
     # and rebuilding streams with hc_expand changes the model computation.
     def make_empty_intermediate_tensors(
@@ -938,7 +938,7 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    # glm53-sm80 2026-08-28: PP enable, delegate to the decoder.
+    # PP enable, delegate to the decoder.
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -1089,7 +1089,7 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-        # glm53-sm80 2026-08-28: PP enable, delegate to language_model.
+        # PP enable, delegate to language_model.
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device

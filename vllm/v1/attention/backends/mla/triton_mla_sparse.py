@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pure-Triton sparse MLA backend for SM80 (A100) / SM121 (GB10)."""
 
-# glm53-sm80 2026-08-28: ported from the dsv4-a100 fork
-# (~/dsv4/vllm) into the vLLM-main + PR#53906 tree. Changes vs the fork:
+# Ported from an internal A100 (sm_80) fork into the vLLM-main +
+# PR#53906 tree. Changes vs the fork:
 # - warmup shapes use self.head_size (576 DeepSeek / 512 GLM-5.3 NoPE)
 #   instead of the fixed _DIM_QK=576;
 # - get_supported_head_sizes advertises both row widths so the GLM-5.3
@@ -54,7 +54,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             return
         device = self.topk_indices_buffer.device
         topk = self.topk_indices_buffer.shape[-1]
-        # glm53-sm80 2026-08-28: head_size IS the per-head qk row
+        # head_size IS the per-head qk row
         # width for MLA (kv_lora_rank + qk_rope_head_dim): 576 DeepSeek,
         # 512 GLM-5.3 NoPE.
         dim_qk = self.head_size
@@ -102,7 +102,7 @@ class TritonMLASparseBackend(XPUMLASparseBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        # glm53-sm80 2026-08-28: 576 (DeepSeek, 512+64 RoPE) and
+        # 576 (DeepSeek, 512+64 RoPE) and
         # 512 (GLM-5.3 NoPE, qk_rope_head_dim=0). The XPU base lists only
         # 576, which would reject the GLM MLA layer at validation.
         return [576, 512]

@@ -69,8 +69,8 @@ class OpenAIModelRegistry:
                 ModelCard(
                     id=base_model.name,
                     max_model_len=max_model_len,
-                    # glm53-sm80 2026-08-28: advertise the spelling
-                    # consumed by DSH and other OpenAI-compatible clients.
+                    # Advertise the spelling consumed by some
+                    # OpenAI-compatible clients.
                     context_window=max_model_len,
                     root=base_model.model_path,
                     permission=[ModelPermission()],

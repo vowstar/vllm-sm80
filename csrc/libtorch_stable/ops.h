@@ -394,11 +394,10 @@ void fused_kda_decode(
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
 #endif
 
-// glm53-sm80 2026-08-28: this declaration was inside the
-// VLLM_ENABLE_FUSED_KDA_DECODE block, but torch_bindings.cpp references it
-// under VLLM_ENABLE_FUSED_GDN_DECODE. On sm_80 only the GDN macro is
-// defined (KDA is sm_90+), so the binding saw no declaration and the build
-// failed. Same fix as the qwen4exp sm_80 build (qwen4exp/vllm-src ops.h).
+// This declaration was inside the VLLM_ENABLE_FUSED_KDA_DECODE block, but
+// torch_bindings.cpp references it under VLLM_ENABLE_FUSED_GDN_DECODE. On
+// sm_80 only the GDN macro is defined (KDA is sm_90+), so the binding saw
+// no declaration and the build failed.
 #ifdef VLLM_ENABLE_FUSED_GDN_DECODE
 void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,

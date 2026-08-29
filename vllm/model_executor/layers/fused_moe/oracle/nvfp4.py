@@ -471,7 +471,7 @@ def convert_to_nvfp4_moe_kernel_format(
         kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(w13.device)
 
         if use_a16:
-            # glm53-sm80 2026-08-28: weight-only NVFP4 keeps
+            # weight-only NVFP4 keeps
             # activations in BF16/FP16. None tells the emulation experts to
             # bypass activation QDQ entirely.
             a13_scale = None

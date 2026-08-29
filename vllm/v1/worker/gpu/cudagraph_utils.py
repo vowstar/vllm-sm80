@@ -846,7 +846,7 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""
     torch.accelerator.synchronize()
     if hasattr(runner.model_state, "_mamba_ctx"):
-        # glm53-sm80 2026-08-28: the profiling config is built from
+        # the profiling config is built from
         # this PP rank's local cache specs,
         # while the runtime config projects global cache groups to every rank.
         # Drop all cached group metadata along with the context so it is rebuilt

@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-# glm53-sm80 2026-08-28: is_deep_gemm_supported() encodes both the
+# is_deep_gemm_supported() encodes both the
 # SM-arch gate (Hopper/Blackwell only) and package presence; has_deep_gemm()
 # alone would still route sm_80 into the DeepGEMM kernels and crash.
 from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -159,7 +159,7 @@ def _scatter_decode_tokens_by_request(
     return out
 
 
-# glm53-sm80 2026-08-28: _top_k_per_row_prefill_torch +
+# _top_k_per_row_prefill_torch +
 # _prefill_topk_needs_torch_fallback ported from the dsv4-a100 fork
 # (model_executor/layers/sparse_attn_indexer.py). The CUDA
 # top_k_per_row_prefill kernel's histogram path (rows with more than
@@ -621,7 +621,7 @@ def sparse_attn_indexer_kpool(
                     clean_logits=False,
                 )
             else:
-                # glm53-sm80 2026-08-28: sm_80 Triton fallback
+                # sm_80 Triton fallback
                 # (DeepGEMM is Hopper/Blackwell-only). Same call contract as
                 # the dsv4-a100 fork's production path.
                 from vllm.v1.attention.ops.mqa_logits_triton import (
@@ -667,7 +667,7 @@ def sparse_attn_indexer_kpool(
                     select_k,
                 )
             elif _prefill_topk_needs_torch_fallback():
-                # glm53-sm80 2026-08-28: the CUDA kernel corrupts
+                # the CUDA kernel corrupts
                 # indices on SM8x/SM12x for rows above topk candidates
                 # (Xid 31 MMU fault downstream) — torch fallback.
                 _top_k_per_row_prefill_torch(
@@ -916,7 +916,7 @@ def sparse_attn_indexer_kpool(
                 clean_logits=False,
             )
         else:
-            # glm53-sm80 2026-08-28: sm_80 Triton fallback (DeepGEMM
+            # sm_80 Triton fallback (DeepGEMM
             # is Hopper/Blackwell-only), same pattern as the dsv4-a100 fork.
             # Two kpool-specific deviations from a blind fork copy:
             # - the Triton kernel indexes context_lens as 1-D [B] and derives
@@ -1114,7 +1114,7 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        # glm53-sm80 2026-08-28: on sm_80 DeepGEMM is unavailable —
+        # on sm_80 DeepGEMM is unavailable —
         # is_deep_gemm_supported() encodes the SM-arch + package gate.
         # Upstream hard-raises here; downgrade to a one-time warning so the
         # indexer routes through the Triton kernels in mqa_logits_triton.py

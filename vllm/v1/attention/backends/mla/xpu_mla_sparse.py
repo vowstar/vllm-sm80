@@ -210,7 +210,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
-        # glm53-sm80 2026-08-28: keep the Indexer itself because MTP
+        # keep the Indexer itself because MTP
         # sharing replaces its buffer after backend construction (vllm#46994).
         self._indexer = indexer
         # The indexer carries the shared buffer for normal layers and tests;
@@ -279,7 +279,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            # glm53-sm80 2026-08-28: GLM pads the topk buffer
+            # GLM pads the topk buffer
             # (index_topk + kpool-1 tail, rounded up to 128) and the indexer
             # fills the whole width with -1 each forward, so padded columns
             # are masked. Convert the physical width; no-op for DeepSeek,

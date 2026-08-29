@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
-# glm53-sm80 2026-08-28: copied verbatim from the sm_80-proven
-# dsv4-a100 fork (~/dsv4/vllm); unchanged.
+# Copied verbatim from an sm_80-proven internal A100 fork; unchanged.
 
 
 import torch

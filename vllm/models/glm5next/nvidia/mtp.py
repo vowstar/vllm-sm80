@@ -324,7 +324,7 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
 
-            # glm53-sm80 2026-08-28: under PP the MTP draft lives on
+            # under PP the MTP draft lives on
             # the last rank, while the target embedding lives on the first.
             # The checkpoint stores only the top-level tied embedding (not a
             # layer-45 copy), so the spec-layer filter below would skip it and

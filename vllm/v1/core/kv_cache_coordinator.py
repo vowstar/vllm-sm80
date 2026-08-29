@@ -928,7 +928,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
-        # glm53-sm80 2026-08-28 APCDIAG: per-group hit visibility
+        # APCDIAG: per-group hit visibility
         import os as _os
         if _os.environ.get("VLLM_APC_DIAG", "0") == "1" and max_cache_hit_length > 50000:
             logger.warning(

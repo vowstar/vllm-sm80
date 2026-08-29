@@ -1080,7 +1080,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptNvFp4Config":
-        # glm53-sm80 2026-08-28: compressed-tensors configs describe
+        # compressed-tensors configs describe
         # activation quantization explicitly. An NVFP4 weight scheme with
         # input_activations=null is W4A16 even if an older producer labels
         # quant_algo simply NVFP4.
@@ -1572,7 +1572,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
 
-        # glm53-sm80 2026-08-28: the emulation kernel can apply the
+        # the emulation kernel can apply the
         # checkpoint's distinct gate/up global scales to the two fused w13
         # output halves. Other backends still require one scalar per expert.
         if (

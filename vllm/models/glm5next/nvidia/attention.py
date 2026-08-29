@@ -299,7 +299,7 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             tail_cache=self.tail_cache,
-            # glm53-sm80 2026-08-28: the Triton-fallback autotune
+            # the Triton-fallback autotune
             # warmup in SparseAttnIndexerKpool keys on the PADDED head count
             # (forward zero-pads n_head < 32 up to 32 for the logits
             # kernels), so pass the same value here.

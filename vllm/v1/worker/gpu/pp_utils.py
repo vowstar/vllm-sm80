@@ -30,7 +30,7 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
-    # glm53-sm80 2026-08-28: proposed draft tokens relayed from the
+    # proposed draft tokens relayed from the
     # last PP rank. Non-last ranks otherwise retain their zero-init buffer.
     draft_tokens: torch.Tensor | None = None  # [num_reqs, max_sample_len - 1]
 
@@ -153,7 +153,7 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
-            # glm53-sm80 2026-08-28: third, ordered collective paired
+            # third, ordered collective paired
             # with broadcast_draft(). This is vllm#46994's MTP x PP relay.
             draft_tokens = None
             if self.max_sample_len > 1:
@@ -201,7 +201,7 @@ class PPHandler:
 
         assert sampled_token_ids.dtype == torch.int64
 
-        # glm53-sm80 2026-08-28: the receiver always posts a fixed
+        # the receiver always posts a fixed
         # [num_reqs, num_spec + 1] tensor, while prefill/first decode naturally
         # emits width 1. NCCL does not negotiate counts; pad or it deadlocks.
         width = sampled_token_ids.shape[-1]

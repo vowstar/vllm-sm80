@@ -1550,7 +1550,7 @@ def postprocess_mamba_align_gpu(
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
     # when src_block_idx == dest_block_idx (copy within the same block), so
     # the original count is preserved for everyone else.
-    # glm53-sm80 2026-08-29: blocking copy, not non_blocking.
+    # blocking copy, not non_blocking.
     # The async D2H landed in the previous step's row order with no event
     # awaiting it, while InputBatch row moves (condense/swap) permute the
     # same pinned buffer and the next preprocess reads it by the new row

@@ -82,7 +82,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "FlashInferMLASparseSM90Backend"
     )
     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
-    # glm53-sm80 2026-08-28: pure-Triton sparse MLA backend
+    # pure-Triton sparse MLA backend
     # (sm_80/sm_121), ported from the dsv4-a100 fork.
     TRITON_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.triton_mla_sparse.TritonMLASparseBackend"

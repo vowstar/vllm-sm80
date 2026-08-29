@@ -77,7 +77,7 @@ class BaseModelLoader(ABC):
             if _has_online_quant(model):
                 finalize_layerwise_processing(model, model_config)
 
-            # glm53-sm80 2026-08-28: VLLM_SERIALIZE_QUANT_CONVERT=1
+            # VLLM_SERIALIZE_QUANT_CONVERT=1
             # serializes the quant conversion phase across ranks. The NVFP4
             # Marlin MoE repack IMAs (Xid 31 MMU region violation) only when
             # all PP workers convert concurrently; bare repros never crash.

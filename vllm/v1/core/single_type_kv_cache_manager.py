@@ -45,6 +45,11 @@ class SingleTypeKVCacheManager(ABC):
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
+    # Tokens an EAGLE/MTP lookup can reach below the replay boundary.
+    # HybridKVCacheCoordinator overwrites this per manager; only
+    # MambaManager._reachable_boundaries consults it.
+    eagle_reach_margin: int = 0
+
     def __init__(
         self,
         kv_cache_spec: KVCacheSpec,

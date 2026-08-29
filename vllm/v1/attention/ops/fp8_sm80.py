@@ -16,8 +16,7 @@ below SM89 (``bitcast`` is allowed), so these substitute:
 ``USE_FNUZ`` branches stay on the hardware convert: FNUZ only occurs on
 gfx942, which has it.
 """
-# glm53-sm80 2026-08-28: copied verbatim from the sm_80-proven
-# dsv4-a100 fork (~/dsv4/vllm); unchanged.
+# Copied verbatim from an sm_80-proven internal A100 fork; unchanged.
 
 
 import torch
@@ -165,7 +164,7 @@ def _decode_fp8_f32(u, USE_FNUZ: tl.constexpr):
 def _decode_fp8_lut(u, USE_FNUZ: tl.constexpr, lut_ptr):
     """FNUZ-aware byte decode; pre-SM89 CUDA reads ``lut_ptr``.
 
-    ``lut_ptr`` must come from :func:`get_e4m3fn_bf16_nan_lut` and is
+    ``lut_ptr`` must come from :func:`get_e4m3fn_bf16_lut` and is
     ignored (compile-time) wherever the hardware convert exists.
     """
     if USE_FNUZ:

@@ -316,7 +316,7 @@ def _repack_marlin_experts(
     is_a_8bit: bool,
 ) -> torch.Tensor:
     """Repack each expert to marlin format into a preallocated output."""
-    # glm53-sm80 2026-08-28: VLLM_MARLIN_REPACK_DEBUG=1 adds
+    # VLLM_MARLIN_REPACK_DEBUG=1 adds
     # per-step sync + pointer dumps to pinpoint the sm_80 IMA (Xid 31)
     # that only reproduces inside vLLM workers, never in bare scripts.
     import os as _os
@@ -328,7 +328,7 @@ def _repack_marlin_experts(
                 f"dev={t.device} off={t.storage_offset()} "
                 f"contig={t.is_contiguous()}")
 
-    # glm53-sm80 2026-08-28: VLLM_MARLIN_REPACK_HOLDOFF=1 works
+    # VLLM_MARLIN_REPACK_HOLDOFF=1 works
     # around a driver/allocator interaction on CMP 170HX (610.43.02) where
     # writes into caching-allocator-reused VA blocks intermittently fault
     # with Xid 31 MMU region violations. Flush cached blocks before the

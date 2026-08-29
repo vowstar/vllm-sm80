@@ -44,7 +44,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.triton_utils import tl, triton
 
-# glm53-sm80 2026-08-28: sm_80 has no native fp8e4nv convert.
+# sm_80 has no native fp8e4nv convert.
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 
 logger = init_logger(__name__)
@@ -235,7 +235,7 @@ def fused_moe_nvfp4_emulation_kernel(
         else:
             b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
 
-        # glm53-sm80: sm_80 has no native fp8e4nv.
+        # sm_80 has no native fp8e4nv.
         b_scale = _decode_fp8_f32(b_scale_raw, False)
         if W_GLOBAL_SCALE_TWO:
             b_scale = b_scale * w_global_scale[:, None]
@@ -299,7 +299,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     if w_global_scale.ndim == 2:
         assert w_global_scale.size(1) == 2
         assert B.size(1) % 2 == 0
-    # glm53-sm80 2026-08-28: Triton cannot bind an fp8 pointer on
+    # Triton cannot bind an fp8 pointer on
     # sm_80 (kernel def line raises); always pass the raw bytes.
     B_scale = B_scale.view(torch.uint8)
 

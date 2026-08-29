@@ -175,7 +175,7 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # apcfix 2026-08-27 (vllm#42948 family):
+        # (vllm#42948 family):
         # Split free blocks into three tiers. Allocation draws uncached first,
         # then cached-never-hit, then cached-hit-proven, so live cache entries
         # are destroyed only at genuine pool pressure and proven-hot prefixes
@@ -731,7 +731,7 @@ class BlockPool:
             self.metrics_collector.on_block_evicted(block)
 
         evicted_hashes = self._remove_cached_block_hashes(block)
-        # glm53-sm80 2026-08-28 APCDIAG: count hash evictions
+        # APCDIAG: count hash evictions
         import os as _os
         if evicted_hashes and _os.environ.get("VLLM_APC_DIAG", "0") == "1":
             BlockPool._apcdiag_evict_count = (

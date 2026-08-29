@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton sparse MLA attention with split-KV for low-batch decode."""
 
-# glm53-sm80 2026-08-28: ported from the dsv4-a100 fork
-# (~/dsv4/vllm, sm_80-proven) and extended with a NoPE variant for
-# GLM-5.3-Flash (qk_rope_head_dim=0): the per-head qk row is a bare
+# Ported from an sm_80-proven internal A100 fork and extended with a
+# NoPE variant for GLM-5.3-Flash (qk_rope_head_dim=0): the per-head
+# qk row is a bare
 # kv_lora_rank=512 with no 64-lane RoPE tail. `BLOCK_DPE` was already a
 # constexpr kernel parameter; it is now derived per launch from the q/kv
 # row width (576 -> 64, 512 -> 0) and every reference to the PE lanes is
@@ -26,7 +26,7 @@ _BLOCK_DV = 512
 # 512 = 512 + 0 (GLM-5.3 NoPE). _DIM_QK kept for the DeepSeek default.
 _BLOCK_DPE = 64
 _DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
-_DIM_QK_NOPE = _BLOCK_DMODEL  # 512, GLM-5.3 NoPE (glm53-sm80 2026-08-28)
+_DIM_QK_NOPE = _BLOCK_DMODEL  # 512, GLM-5.3 NoPE
 
 _BLOCK_H = 16
 
@@ -98,7 +98,7 @@ def _sparse_mla_compute_tile(
         mask=mask_h[:, None],
         other=0.0,
     )
-    # glm53-sm80 2026-08-28: NoPE variant — the RoPE lanes only
+    # NoPE variant — the RoPE lanes only
     # exist when BLOCK_DPE > 0 (tl.arange(0, 0) is illegal, and the extra
     # dot would read past the 512-wide NoPE row).
     if BLOCK_DPE > 0:
@@ -133,7 +133,7 @@ def _sparse_mla_compute_tile(
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
 
-        # glm53-sm80 2026-08-29: widen address math to int64.
+        # widen address math to int64.
         # With a 918-block x 4608-row pool and stride_kv_token=512, rows
         # >= 2**31/512 (= 4,194,304, i.e. physical blocks 910+) overflow
         # int32 and wrap negative — they pass mask_kv (which tests the
@@ -150,7 +150,7 @@ def _sparse_mla_compute_tile(
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
         qk = tl.dot(q, k.to(q.dtype))
 
-        # glm53-sm80 2026-08-28: NoPE variant — skip the PE dot
+        # NoPE variant — skip the PE dot
         # entirely when BLOCK_DPE == 0 (see above).
         if BLOCK_DPE > 0:
             offs_kpe = (
@@ -475,7 +475,7 @@ def triton_mla_sparse_attention(
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
     """
     num_tokens, num_heads_q, dim_qk = q.shape
-    # glm53-sm80 2026-08-28: NoPE variant — accept the GLM-5.3
+    # NoPE variant — accept the GLM-5.3
     # 512-wide row (BLOCK_DPE=0) alongside the DeepSeek 576 (BLOCK_DPE=64).
     assert dim_qk in (_DIM_QK, _DIM_QK_NOPE), (
         f"sparse MLA kernel requires dim_qk in ({_DIM_QK}, {_DIM_QK_NOPE}) "
