@@ -13,9 +13,12 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config.cache import CacheDType
 from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    AttentionLayer,
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
@@ -59,7 +62,13 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         # 512 GLM-5.3 NoPE.
         dim_qk = self.head_size
         q = torch.empty(1, self.num_heads, dim_qk, dtype=torch.bfloat16, device=device)
-        kv = torch.empty(64, 1, dim_qk, dtype=torch.bfloat16, device=device)
+        is_fp8 = is_quantized_kv_cache(self.kv_cache_dtype)
+        kv = torch.empty(
+            64, 1, dim_qk, dtype=torch.uint8 if is_fp8 else torch.bfloat16, device=device
+        )
+        kv_scale = (
+            torch.ones(1, dtype=torch.float32, device=device) if is_fp8 else None
+        )
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -69,6 +78,7 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 sm_scale=self.softmax_scale,
                 num_kv_splits=splits,
                 sm_count=self._sm_count,
+                kv_scale=kv_scale,
             )
 
     def _forward_bf16_kv(
@@ -92,9 +102,44 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         )
         return output
 
+    def _forward_fp8_kv(
+        self,
+        q: torch.Tensor,  # [sq, heads, d_qk]
+        kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk] uint8
+        topk_indices: torch.Tensor,  # [sq, topk]
+        attn_metadata: XPUMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
+            -1, 1, kv_c_and_k_pe_cache.shape[-1]
+        )
+        topk_indices = topk_indices.view(num_tokens, 1, -1)
+        return triton_mla_sparse_attention(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            sm_scale=self.softmax_scale,
+            sm_count=self._sm_count,
+            kv_scale=layer._k_scale,
+        )
+
 
 class TritonMLASparseBackend(XPUMLASparseBackend):
-    """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels."""
+    """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels.
+
+    Also serves fp8 (e4m3fn, per-tensor scale) KV caches: the kernels
+    dequantize uint8 bytes to fp16 in-register, so no sm_89 fp8 support
+    is required (see triton_mla_sparse_kernel.py).
+    """
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:

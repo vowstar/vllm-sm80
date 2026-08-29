@@ -11,6 +11,16 @@
 # guarded by `BLOCK_DPE > 0` so the 0-width case compiles. Upstream's FA3
 # sparse backend handles the same NoPE shape with a dummy-64 + only_qv
 # trick; making BLOCK_DPE a real 0 here avoids the 12.5% dummy bandwidth.
+#
+# FP8 KV (e4m3fn, per-tensor scale): Triton on sm_80 rejects fp8e4nv
+# pointer element types ("not supported in this architecture"), so the
+# cache stays uint8-typed and every load is dequantized in-kernel with
+# a 6-op bit assembly into fp16 (e4m3 values are exact in fp16). The
+# dot then runs on the fp16 tensor-core path; no fp8 MMA (sm_89+) is
+# needed. Measured on CMP 170HX (sm_80): uint8 gather + assembly keeps
+# ~0.9x of the bf16 kernel's effective bandwidth while reading half
+# the bytes; heavier dequant schemes (fp32/uint16 bit math, 256-entry
+# LUT) collapse to ~0.3x.
 
 import functools
 
@@ -61,6 +71,24 @@ _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 
 
 @triton.jit
+def _dequant_fp8_e4m3(b):
+    """uint8 e4m3fn bit pattern -> fp16, WITHOUT the per-tensor scale.
+
+    ((b&0x80)<<8) | (((b&0x7F)<<7) + 0x2000): sign to bit 15, exponent
+    rebased +8 (e4m3 bias 7 -> fp16 bias 15), mantissa to the fp16 top
+    bits. Exact for normals and every e4m3 value stays exact in fp16,
+    which also puts the dot on the fp16 tensor-core path. Subnormal
+    inputs (true |x| < 2^-6) read as (1+m/8)*2^-7 instead of m*2^-9:
+    an absolute error below 0.016 on the ~1% of RMS-normalized latents
+    that small, far below the attention noise floor. The per-tensor
+    scale is applied separately as scalar multiplies (see call sites).
+    """
+    bi = b.to(tl.uint16)
+    h = ((bi & 0x80) << 8) | (((bi & 0x7F) << 7) + 0x2000)
+    return h.to(tl.float16, bitcast=True)
+
+
+@triton.jit
 def _sparse_mla_compute_tile(
     q_buffer,
     k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
@@ -79,14 +107,18 @@ def _sparse_mla_compute_tile(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    kv_scale_ptr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ):
     """Shared stage-1 body: load Q, run the sparse online-softmax loop over
     `[split_start, split_end)` of the topk axis, return accumulators."""
+    if KV_IS_FP8:
+        kv_scale = tl.load(kv_scale_ptr)
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
 
@@ -98,6 +130,10 @@ def _sparse_mla_compute_tile(
         mask=mask_h[:, None],
         other=0.0,
     )
+    if KV_IS_FP8:
+        # fp16 compute path for the fp8 cache: q converts once per
+        # program instead of converting every gathered K/V tile to bf16.
+        q = q.to(tl.float16)
     # NoPE variant — the RoPE lanes only
     # exist when BLOCK_DPE > 0 (tl.arange(0, 0) is illegal, and the extra
     # dot would read past the 512-wide NoPE row).
@@ -111,6 +147,8 @@ def _sparse_mla_compute_tile(
             mask=mask_h[:, None],
             other=0.0,
         )
+        if KV_IS_FP8:
+            qpe = qpe.to(tl.float16)
 
     # Finite sentinel (not -inf) — when an entire BLOCK_N tile is masked,
     # `-inf - -inf = NaN` poisons the softmax; `sentinel - sentinel = 0`
@@ -148,6 +186,8 @@ def _sparse_mla_compute_tile(
             + offs_d[:, None]
         )
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+        if KV_IS_FP8:
+            k = _dequant_fp8_e4m3(k)
         qk = tl.dot(q, k.to(q.dtype))
 
         # NoPE variant — skip the PE dot
@@ -163,9 +203,15 @@ def _sparse_mla_compute_tile(
                 mask=mask_kv[None, :],
                 other=0.0,
             )
+            if KV_IS_FP8:
+                kpe = _dequant_fp8_e4m3(kpe)
             qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
+        if KV_IS_FP8:
+            # K-side dequant scale: one scalar broadcast on the fp32
+            # logits instead of a per-element multiply on the K tile.
+            qk *= kv_scale
         qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
 
         offs_v = (
@@ -174,6 +220,12 @@ def _sparse_mla_compute_tile(
             + offs_dv[None, :]
         )
         v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+        if KV_IS_FP8:
+            v = _dequant_fp8_e4m3(v)
+            # The assembly maps the masked-load 0x00 filler to ~0.008,
+            # not 0; fully-masked tiles rely on zero V rows (see the
+            # NEG_LARGE sentinel above), so re-apply the mask.
+            v = tl.where(mask_kv[:, None], v, 0.0)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
@@ -183,6 +235,10 @@ def _sparse_mla_compute_tile(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
+    if KV_IS_FP8:
+        # V-side dequant scale: fold into the accumulator once per
+        # program instead of a per-element multiply on the V tile.
+        acc *= kv_scale
     return acc, e_max, e_sum
 
 
@@ -204,6 +260,7 @@ def _sparse_mla_kernel_final(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    kv_scale_ptr,
     index_topk: tl.constexpr,
     kv_group_num: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -211,6 +268,7 @@ def _sparse_mla_kernel_final(
     BLOCK_DV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ):
     """Single-pass fast path: full topk, write final bf16 output directly."""
     cur_q = tl.program_id(0)
@@ -239,11 +297,13 @@ def _sparse_mla_kernel_final(
         stride_indices_token,
         stride_indices_head,
         sm_scale,
+        kv_scale_ptr,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        KV_IS_FP8,
     )
 
     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
@@ -281,6 +341,7 @@ def _sparse_mla_kernel_split(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    kv_scale_ptr,
     index_topk: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
     kv_group_num: tl.constexpr,
@@ -290,6 +351,7 @@ def _sparse_mla_kernel_split(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DPE: tl.constexpr,
     LOGE2: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ):
     """Stage 1 of split-KV: process one slice of the topk axis and write
     its `(out_partial, lse_partial)` into the mid buffer."""
@@ -324,11 +386,13 @@ def _sparse_mla_kernel_split(
         stride_indices_token,
         stride_indices_head,
         sm_scale,
+        kv_scale_ptr,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
         BLOCK_DMODEL,
         BLOCK_DPE,
+        KV_IS_FP8,
     )
 
     # Partial output and natural-log LSE for stage-2 merge.
@@ -460,16 +524,20 @@ def triton_mla_sparse_attention(
     sm_scale: float,
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
+    kv_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse MLA attention over topk indices.
 
     Args:
         q:         [num_tokens, num_heads_q, dim_qk] bf16
-        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
+        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16, or uint8 holding
+                   e4m3fn bit patterns when `kv_scale` is given
         indices:   [num_tokens, num_heads_kv=1, topk] int32
         sm_scale:  softmax scale
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
         sm_count:  cached device SM count for the split heuristic.
+        kv_scale:  per-tensor fp32 dequant scale for an fp8 (uint8) cache;
+                   None means the cache is bf16.
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
@@ -491,6 +559,16 @@ def triton_mla_sparse_attention(
 
     kv_group_num = num_heads_q
     num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
+
+    kv_is_fp8 = kv_scale is not None
+    if kv_is_fp8:
+        assert kv.dtype == torch.uint8, (
+            f"fp8 KV cache must reach the kernel as uint8 bytes, got {kv.dtype}"
+        )
+        assert kv_scale.dtype == torch.float32 and kv_scale.numel() == 1
+    else:
+        # Signature placeholder; dead code under KV_IS_FP8=False.
+        kv_scale = q
 
     if num_kv_splits is None or num_kv_splits == 0:
         if sm_count is None:
@@ -522,12 +600,14 @@ def triton_mla_sparse_attention(
             stride_indices_token=indices.stride(0),
             stride_indices_head=indices.stride(1),
             sm_scale=sm_scale * LOG2E,
+            kv_scale_ptr=kv_scale,
             index_topk=index_topk,
             kv_group_num=kv_group_num,
             BLOCK_H=_BLOCK_H,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
             BLOCK_DPE=block_dpe,
+            KV_IS_FP8=kv_is_fp8,
         )
         return out
 
@@ -554,6 +634,7 @@ def triton_mla_sparse_attention(
         stride_indices_token=indices.stride(0),
         stride_indices_head=indices.stride(1),
         sm_scale=sm_scale * LOG2E,
+        kv_scale_ptr=kv_scale,
         index_topk=index_topk,
         NUM_KV_SPLITS=num_kv_splits,
         kv_group_num=kv_group_num,
@@ -562,6 +643,7 @@ def triton_mla_sparse_attention(
         BLOCK_DMODEL=_BLOCK_DMODEL,
         BLOCK_DPE=block_dpe,
         LOGE2=LOGE2,
+        KV_IS_FP8=kv_is_fp8,
     )
 
     _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](

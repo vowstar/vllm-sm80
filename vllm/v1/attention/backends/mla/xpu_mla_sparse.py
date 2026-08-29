@@ -243,6 +243,18 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         return output[:, : self.num_heads, :]
 
+    def _forward_fp8_kv(
+        self,
+        q: torch.Tensor,  # [sq, heads, d_qk]
+        kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk] uint8
+        topk_indices: torch.Tensor,  # [sq, topk]
+        attn_metadata: XPUMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "FP8 kv is not supported with XPU MLA Sparse yet"
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -252,9 +264,6 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
-
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
 
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
@@ -287,6 +296,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
-        attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            attn_out = self._forward_fp8_kv(
+                q, kv_rows, topk_indices_global, attn_metadata, layer
+            )
+        else:
+            attn_out = self._forward_bf16_kv(
+                q, kv_rows, topk_indices_global, attn_metadata
+            )
 
         return attn_out, None
