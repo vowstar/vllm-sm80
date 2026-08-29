@@ -190,6 +190,17 @@ class BlockPool:
         self.free_block_queue = FreeKVCacheBlockQueue([])
         self.free_queue_hot = FreeKVCacheBlockQueue([])
 
+        # Bound the hit-proven tier. Without a cap, stale proven content
+        # accumulates across workload phases and outranks every fresh
+        # never-hit prefix forever; there is no TTL. VLLM_APC_HOT_CAP_PCT
+        # bounds the hot tier to this percent of the pool (default 50).
+        # 0 disables the cap and restores the unbounded behavior.
+        import os as _os
+        hot_pct = int(_os.environ.get("VLLM_APC_HOT_CAP_PCT", "50"))
+        self._apc_hot_cap_blocks = (
+            self.num_gpu_blocks * hot_pct // 100 if hot_pct > 0 else -1
+        )
+
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
@@ -803,6 +814,37 @@ class BlockPool:
         for block in blocks_hot:
             block.apcfix_q = 3
         self.free_queue_hot.append_n(blocks_hot)
+        self._apc_enforce_hot_cap()
+
+    def _apc_enforce_hot_cap(self) -> None:
+        """Demote the oldest hit-proven blocks to the cold cached tier
+        once the hot tier exceeds ``_apc_hot_cap_blocks``.
+
+        Demoted blocks keep their hashes, so a later hit still works and
+        returns them to the hot tier on the next free. They go to the
+        head of the cold tier because their effective recency is the
+        oldest in the pool, so they become the next eviction candidates
+        after the uncached tier.
+        """
+        if self._apc_hot_cap_blocks < 0:
+            return
+        excess = self.free_queue_hot.num_free_blocks - self._apc_hot_cap_blocks
+        if excess <= 0:
+            return
+        demoted = self.free_queue_hot.popleft_n(excess)
+        for block in demoted:
+            block.apcfix_q = 2
+        self.free_block_queue.prepend_n(demoted)
+
+        import os as _os
+        if _os.environ.get("VLLM_APC_DIAG", "0") == "1":
+            logger.warning(
+                "APCDIAG hot-cap: demoted %d block(s) to cold tier, "
+                "hot=%d cold=%d",
+                len(demoted),
+                self.free_queue_hot.num_free_blocks,
+                self.free_block_queue.num_free_blocks,
+            )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
