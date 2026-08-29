@@ -176,29 +176,36 @@ class BlockPool:
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
         # (vllm#42948 family):
-        # Split free blocks into three tiers. Allocation draws uncached first,
-        # then cached-never-hit, then cached-hit-proven, so live cache entries
-        # are destroyed only at genuine pool pressure and proven-hot prefixes
-        # are sacrificed last.
+        # Split free blocks into an uncached tier and a cached tier.
+        # Allocation draws uncached first, so live cache entries are
+        # destroyed only at genuine pool pressure. Cached blocks form a
+        # single FIFO: provenance does not outrank recency (a separate
+        # hit-proven tier was removed because it locked stale content out
+        # of circulation under continuous load).
         #
-        # Keep the cold cached tier under the historical `free_block_queue`
+        # Keep the cached tier under the historical `free_block_queue`
         # name because simple KV offload walks that queue for eviction
-        # candidates.
+        # candidates. `free_queue_hot` stays allocated but unused so the
+        # shared queue bookkeeping keeps working.
         self.free_queue_uncached = FreeKVCacheBlockQueue(self.blocks)
         for block in self.blocks:
             block.apcfix_q = 1
         self.free_block_queue = FreeKVCacheBlockQueue([])
         self.free_queue_hot = FreeKVCacheBlockQueue([])
 
-        # Bound the hit-proven tier. Without a cap, stale proven content
-        # accumulates across workload phases and outranks every fresh
-        # never-hit prefix forever; there is no TTL. VLLM_APC_HOT_CAP_PCT
-        # bounds the hot tier to this percent of the pool (default 50).
-        # 0 disables the cap and restores the unbounded behavior.
+        # Un-hashed headroom. A brim-full working set still needs transient
+        # blocks that carry no hash: mamba running-state copies during
+        # prefill and decode, and the probe-time state allocations of a
+        # cache hit. If every free block is hashed, those transient
+        # allocations evict the cold tier head, which after a full
+        # working-set swap is the newest working set's own oldest chain,
+        # and the resulting miss re-prefills and cascades through every
+        # cached stream. VLLM_APC_HEADROOM_BLOCKS keeps at least this many
+        # blocks un-hashed (default 32, 0 disables) by evicting the oldest
+        # cold-tier hashes early.
         import os as _os
-        hot_pct = int(_os.environ.get("VLLM_APC_HOT_CAP_PCT", "50"))
-        self._apc_hot_cap_blocks = (
-            self.num_gpu_blocks * hot_pct // 100 if hot_pct > 0 else -1
+        self._apc_headroom_blocks = max(
+            0, int(_os.environ.get("VLLM_APC_HEADROOM_BLOCKS", "32"))
         )
 
         # Cache for block lookup
@@ -221,16 +228,24 @@ class BlockPool:
         """Pop raw free blocks in tier order, without refcount handling."""
         ret: list[KVCacheBlock] = []
         remaining = num_blocks
-        for queue in (
-            self.free_queue_uncached,
-            self.free_block_queue,
-            self.free_queue_hot,
+        for src_q, queue in enumerate(
+            (
+                self.free_queue_uncached,
+                self.free_block_queue,
+                self.free_queue_hot,
+            ),
+            start=1,
         ):
             if remaining == 0:
                 break
             take = min(remaining, queue.num_free_blocks)
             if take > 0:
-                ret.extend(queue.popleft_n(take))
+                popped = queue.popleft_n(take)
+                # APCDIAG: remember the source tier so the eviction log can
+                # show it (apcfix_q itself is cleared below).
+                for block in popped:
+                    block._apcdiag_src_q = src_q
+                ret.extend(popped)
                 remaining -= take
         for block in ret:
             block.apcfix_q = 0
@@ -748,10 +763,10 @@ class BlockPool:
             BlockPool._apcdiag_evict_count = (
                 getattr(BlockPool, "_apcdiag_evict_count", 0) + 1)
             n = BlockPool._apcdiag_evict_count
-            if n <= 20 or n % 200 == 0:
-                logger.warning(
-                    "APCDIAG evict #%d: block removed %d hash(es), q=%d",
-                    n, len(evicted_hashes), getattr(block, "apcfix_q", -1))
+            logger.warning(
+                "APCDIAG evict #%d: block=%s removed %d hash(es), src=%d",
+                n, block.block_id, len(evicted_hashes),
+                getattr(block, "_apcdiag_src_q", -1))
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
@@ -775,8 +790,9 @@ class BlockPool:
                 block.apcfix_q = 0
             block.ref_cnt += 1
             if not block.is_null:
-                # A touch is a proven prefix-cache hit, so this content
-                # re-enters the hit-proven tier on its next free.
+                # A touch is a proven prefix-cache hit. The flag no longer
+                # changes eviction order (single FIFO now), it only records
+                # reuse provenance for diagnostics.
                 block.apcfix_hit = True
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -791,7 +807,6 @@ class BlockPool:
         """
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last: list[KVCacheBlock] = []
-        blocks_hot: list[KVCacheBlock] = []
         blocks_to_evict_first: list[KVCacheBlock] = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
@@ -799,10 +814,12 @@ class BlockPool:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
-                elif block.apcfix_hit:
-                    blocks_hot.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
+                    # Provenance does not outrank recency: a former
+                    # hit-proven tier locked stale proven content out of
+                    # circulation under continuous load, because cold is
+                    # never empty and the hot tier was never popped.
                     blocks_to_evict_last.append(block)
 
         for block in blocks_to_evict_first:
@@ -811,40 +828,39 @@ class BlockPool:
         for block in blocks_to_evict_last:
             block.apcfix_q = 2
         self.free_block_queue.append_n(blocks_to_evict_last)
-        for block in blocks_hot:
-            block.apcfix_q = 3
-        self.free_queue_hot.append_n(blocks_hot)
-        self._apc_enforce_hot_cap()
+        self._apc_enforce_headroom()
 
-    def _apc_enforce_hot_cap(self) -> None:
-        """Demote the oldest hit-proven blocks to the cold cached tier
-        once the hot tier exceeds ``_apc_hot_cap_blocks``.
+    def _apc_enforce_headroom(self) -> None:
+        """Keep at least ``_apc_headroom_blocks`` un-hashed blocks in the
+        uncached tier by evicting the oldest cached hashes early.
 
-        Demoted blocks keep their hashes, so a later hit still works and
-        returns them to the hot tier on the next free. They go to the
-        head of the cold tier because their effective recency is the
-        oldest in the pool, so they become the next eviction candidates
-        after the uncached tier.
+        Victims come from the cold tier head, which matches the normal
+        allocation order. Evicted blocks move to the uncached tier, so
+        transient allocations (mamba state copies, probe-time running
+        state) never need to evict a hash.
         """
-        if self._apc_hot_cap_blocks < 0:
+        if self._apc_headroom_blocks <= 0:
             return
-        excess = self.free_queue_hot.num_free_blocks - self._apc_hot_cap_blocks
-        if excess <= 0:
-            return
-        demoted = self.free_queue_hot.popleft_n(excess)
-        for block in demoted:
-            block.apcfix_q = 2
-        self.free_block_queue.prepend_n(demoted)
+        while self.free_queue_uncached.num_free_blocks < self._apc_headroom_blocks:
+            if self.free_block_queue.num_free_blocks > 0:
+                block = self.free_block_queue.popleft_n(1)[0]
+            elif self.free_queue_hot.num_free_blocks > 0:
+                block = self.free_queue_hot.popleft_n(1)[0]
+            else:
+                break
+            self._maybe_evict_cached_block(block)
+            block.apcfix_q = 1
+            self.free_queue_uncached.prepend_n([block])
 
-        import os as _os
-        if _os.environ.get("VLLM_APC_DIAG", "0") == "1":
-            logger.warning(
-                "APCDIAG hot-cap: demoted %d block(s) to cold tier, "
-                "hot=%d cold=%d",
-                len(demoted),
-                self.free_queue_hot.num_free_blocks,
-                self.free_block_queue.num_free_blocks,
-            )
+            import os as _os
+            if _os.environ.get("VLLM_APC_DIAG", "0") == "1":
+                logger.warning(
+                    "APCDIAG headroom: evicted block=%s early, "
+                    "uncached=%d cold=%d",
+                    block.block_id,
+                    self.free_queue_uncached.num_free_blocks,
+                    self.free_block_queue.num_free_blocks,
+                )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

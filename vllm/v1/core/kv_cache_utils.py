@@ -190,6 +190,11 @@ class KVCacheBlock:
     # hit-proven); only BlockPool maintains it.
     apcfix_hit: bool = False
     apcfix_q: int = 0
+    # APCDIAG only: the free-queue tier this block was last popped from
+    # (apcfix_q itself is cleared at pop time, so the eviction log would
+    # otherwise always show 0). Written on every pop, read only by the
+    # VLLM_APC_DIAG eviction log.
+    _apcdiag_src_q: int = -1
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
