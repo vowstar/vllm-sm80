@@ -1,110 +1,88 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vllm-sm80
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+A vLLM fork that runs GLM-5.3-Flash on sm_80 GPUs. The base is vllm-project/vllm at PR #53906 (commit 142062f). Our work sits on top in the branch glm53-sm80.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+We develop and test on 5x CMP 170HX 64 GB (GA100) with pipeline parallel 5, driver 610.43.02. Other sm_80 cards such as A100 are untested.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## Status
 
----
+| Feature | State |
+| --- | --- |
+| GLM-5.3-Flash NVFP4 W4A16 MoE | Works. Marlin backend in production. Triton emulation backend as fallback. |
+| MTP x3 speculative decoding | Works |
+| Context 1,048,576 tokens | Works. KV pool 3.79M tokens across 5 ranks. |
+| Prefix caching | Works after the fixes listed below |
+| Vision input | Works |
+| Tool calls, glm47 parser | Works |
 
-## About
+Measured on 2026-08-28 and 2026-08-29, 5x CMP 170HX, PP5 partition 11,9,9,9,7, MTP x3, marlin backend:
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+| Test | Result |
+| --- | --- |
+| Decode, single stream, 200K prefix | about 100 tok/s |
+| Decode, 10 concurrent 200K prefixes | about 382 tok/s aggregate |
+| Cold prefill, one 200K prefix | about 32 s |
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+## Changes on top of #53906
 
-vLLM is fast with:
+| Area | Change |
+| --- | --- |
+| Sparse MLA attention | Triton kernel port for sm_80. NoPE path. Indexer Triton fallback. |
+| FP8 KV stores | Software e4m3fn encoding on sm_80 |
+| NVFP4 MoE | W4A16 path. Marlin repack holdoff. Fused Triton emulation kernel. |
+| Prefix caching | Port of #53479. Port of #53962. Tiered free queue eviction policy. Env gated diagnostics (APCDIAG). |
+| Sparse MLA kernel | int64 fix for KV pools above 4,194,304 rows |
+| Mamba align postprocess | Blocking D2H copy for the accepted count |
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+## Run
 
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+This is our production shape. Adapt the GPU count and the layer partition to your cards.
 
 ```bash
-uv pip install vllm
+docker run -d --name glm53 --runtime=nvidia \
+  -e NVIDIA_VISIBLE_DEVICES=0,1,2,3,4 \
+  -e VLLM_PP_LAYER_PARTITION=11,9,9,9,7 \
+  -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=73728 \
+  -e VLLM_MARLIN_REPACK_HOLDOFF=1 \
+  -v /path/to/GLM-5.3-Flash-NVFP4:/model \
+  --shm-size=16g -p 8099:8000 \
+  vllm-sm80:latest vllm serve /model \
+  --served-model-name GLM-5.3-Flash \
+  --pipeline-parallel-size 5 --kv-cache-dtype bfloat16 \
+  --block-size 256 --max-model-len 1048576 \
+  --max-num-batched-tokens 8192 --trust-remote-code \
+  --gpu-memory-utilization 0.89 --max-num-seqs 32 \
+  --kv-cache-memory 13421772800 \
+  --reasoning-parser glm47 \
+  --enable-auto-tool-choice --tool-call-parser glm47 \
+  --moe-backend marlin \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+| Flag | Why |
+| --- | --- |
+| `--block-size 256` | The indexer cache needs block_size % 128 == 0. The Triton sparse MLA backend declares MultipleOf(64). 256 satisfies both. |
+| `VLLM_PP_LAYER_PARTITION` | The last rank also carries lm_head and the MTP draft layer. 11,9,9,9,7 is the most even split by checkpoint bytes. |
+| `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | In scheduler tokens. 73728 is 16 mamba aligned pages of 4608 tokens. |
+| `VLLM_MARLIN_REPACK_HOLDOFF` | Works around a load time MMU fault on CMP 170HX plus driver 610.43.02. Costs a few GiB transient during load. On other hardware, set it to 0. |
+| `--kv-cache-memory` | The pool derived from gpu-memory-utilization is too small. At saturation the mamba state copies evict all hashed checkpoints. |
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+## Caveats
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+| Item | Detail |
+| --- | --- |
+| KDA numerics | The KDA path deviates about 7 percent from the reference in some tests |
+| KV capacity | Mamba state pages alias into larger blocks. About 10 MB per block stays idle. Effective capacity is lower than the raw pool size suggests. |
 
-## Contributing
+## Attribution
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+| Work | By |
+| --- | --- |
+| GLM-5.3-Flash support in vLLM, PR #53906 | ZJY0516 |
+| Mamba align boundary fix, PR #53479 | kamb-code |
+| Scheduler spec decode padding fix, PR #53962 | njhill |
+| CMP 170HX method reference | allover326/deepseek-v4-cmp170hx |
 
-## Citation
+## Maintenance
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+This is a personal production fork. When upstream vLLM merges equivalent sm_80 support, this repository will link to it.
