@@ -86,6 +86,7 @@ docker run -d --name glm53 --runtime=nvidia \
 | KV capacity | Mamba state pages alias into larger blocks. About 10 MB per block stays idle. Effective capacity is lower than the raw pool size suggests. |
 | Headroom | 32 blocks stay un-hashed for transient mamba state allocations. Set VLLM_APC_HEADROOM_BLOCKS=0 to disable. |
 | FP8 KV prefill cost | Prefill runs about 1.8 times slower than bfloat16 KV because the dequant is ALU bound at prefill shapes. Decode speed is unchanged. The larger prefix cache pool offsets repeat prefill work. |
+| Checkpoint index versions | The current upstream index adds input_scale entries for W4A4 users. This fork ignores them, so old and new indexes both load. An index from before 2026-08-29 works too if you pin the repository revision. |
 
 ## Attribution
 
