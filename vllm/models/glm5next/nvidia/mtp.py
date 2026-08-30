@@ -308,6 +308,9 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # See Glm5NextModel.load_weights: ignore per-expert input_scale
+        # entries unless this (W4A4) model registers them.
+        wants_input_scales = any("input_scale" in n for n in params_dict)
         _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
@@ -316,6 +319,8 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             kv_a_pad_size = self.config.qk_rope_head_dim
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith(".input_scale") and not wants_input_scales:
                 continue
             # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix
             # the text-tower weights with "model.language_model."; the MTP head

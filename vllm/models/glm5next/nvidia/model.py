@@ -782,6 +782,13 @@ class Glm5NextModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        # Newer checkpoint indexes also publish per-expert `input_scale`
+        # tensors for W4A4 (activations quantized) users. This model only
+        # registers input-scale parameters when its quantization path
+        # needs them; drop the entries otherwise, or the fused-name lookup
+        # below raises KeyError on weight-only (W4A16) checkpoints.
+        wants_input_scales = any("input_scale" in n for n in params_dict)
+
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; pad them with zeros for the model shape.
         kv_a_pad_size = 0
@@ -794,6 +801,8 @@ class Glm5NextModel(nn.Module):
             name, loaded_weight = args[:2]
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith(".input_scale") and not wants_input_scales:
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
