@@ -1032,6 +1032,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return next(iter(self.kv_cache_specs.values()))
 
     @property
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching
+            for spec in self.kv_cache_specs.values()
+        )
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
