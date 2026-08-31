@@ -166,7 +166,7 @@ def test_config_exposes_vision_fields_without_enabling_text_checkpoints() -> Non
     assert vision_config.vision_max_n_token == 384
 
 
-def test_weight_mapper_preserves_official_vision_names() -> None:
+def test_weight_mapper_preserves_official_vision_and_vl_router_names() -> None:
     from vllm.models.deepseek_v4.nvidia.model import (
         _make_deepseek_v4_weights_mapper,
     )
@@ -177,6 +177,7 @@ def test_weight_mapper_preserves_official_vision_names() -> None:
         "vision.blocks.0.attn.wqkv.bias",
         "aligner.w1.weight",
         "image_start",
+        "layers.3.ffn.gate.bias_vl",
     ]
 
     assert mapper.apply_list(source_names) == [
@@ -184,4 +185,5 @@ def test_weight_mapper_preserves_official_vision_names() -> None:
         "vision.blocks.0.attn.wqkv.bias",
         "aligner.w1.weight",
         "image_start",
+        "model.layers.3.ffn.gate.bias_vl",
     ]

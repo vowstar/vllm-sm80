@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
+    fused_topk_bias_vl,
 )
 from vllm.platforms import current_platform
 
@@ -45,6 +46,37 @@ def _torch_topk_softplus_sqrt(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _torch_topk_softplus_sqrt_vl(
+    gating_output: torch.Tensor,
+    input_ids: torch.Tensor,
+    vocab_size: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    text_bias: torch.Tensor,
+    vision_bias: torch.Tensor,
+    hash_indices_table: torch.Tensor | None = None,
+):
+    scores = F.softplus(gating_output.float()).sqrt()
+    image_mask = input_ids >= vocab_size
+    safe_input_ids = input_ids.masked_fill(image_mask, 0)
+    if hash_indices_table is None:
+        text_ids = torch.topk(
+            scores + text_bias.unsqueeze(0), k=topk, dim=-1, sorted=True
+        )[1]
+    else:
+        text_ids = hash_indices_table[safe_input_ids.long()]
+    vision_ids = torch.topk(
+        scores + vision_bias.unsqueeze(0), k=topk, dim=-1, sorted=True
+    )[1]
+    topk_ids = torch.where(image_mask.unsqueeze(-1), vision_ids, text_ids)
+    topk_weights = scores.gather(1, topk_ids.long())
+    if renormalize:
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights *= routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
@@ -188,6 +220,75 @@ def test_fused_topk_softplus_sqrt_hash(
     sorted_w_ref = topk_weights_ref.gather(1, idx_ref)
     sorted_w = topk_weights.gather(1, idx_ops)
     torch.testing.assert_close(sorted_w_ref, sorted_w, atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="This test is skipped on non-CUDA platform.",
+)
+@pytest.mark.parametrize("use_hash", [False, True])
+def test_fused_topk_softplus_sqrt_vl(use_hash: bool):
+    """Image OOV IDs use bias_vl without indexing the text hash table."""
+    torch.manual_seed(17)
+    num_tokens = 9
+    num_experts = 256
+    hidden_size = 64
+    topk = 6
+    vocab_size = 32
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    text_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    vision_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    input_ids = torch.tensor(
+        [0, vocab_size, 3, vocab_size + 1, 7, vocab_size + 2, 11, 13, 17],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    hash_indices_table = None
+    if use_hash:
+        hash_indices_table = torch.stack(
+            [torch.randperm(num_experts)[:topk] for _ in range(vocab_size)]
+        ).to(device="cuda", dtype=torch.int32)
+
+    ref_weights, ref_ids = _torch_topk_softplus_sqrt_vl(
+        gating_output,
+        input_ids,
+        vocab_size,
+        topk,
+        True,
+        1.5,
+        text_bias,
+        vision_bias,
+        hash_indices_table,
+    )
+    topk_weights, topk_ids = fused_topk_bias_vl(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=text_bias,
+        topk=topk,
+        renormalize=True,
+        indices_type=torch.int32,
+        input_tokens=input_ids,
+        hash_indices_table=hash_indices_table,
+        routed_scaling_factor=1.5,
+        e_score_correction_bias_vl=vision_bias,
+        vl_vocab_size=vocab_size,
+    )
+
+    sorted_ref_ids, ref_order = ref_ids.sort(dim=-1)
+    sorted_ids, actual_order = topk_ids.sort(dim=-1)
+    torch.testing.assert_close(sorted_ids, sorted_ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        topk_weights.gather(1, actual_order),
+        ref_weights.gather(1, ref_order),
+        atol=2e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.skipif(

@@ -111,6 +111,8 @@ def FusedMoEFactory(
     activation_situ_beta: float | None = None,
     activation_situ_linear_beta: float | None = None,
     e_score_correction_bias: torch.Tensor | None = None,
+    e_score_correction_bias_vl: torch.Tensor | None = None,
+    vl_vocab_size: int | None = None,
     apply_router_weight_on_input: bool = False,
     activation: str = "silu",
     enable_eplb: bool = False,
@@ -173,6 +175,8 @@ def FusedMoEFactory(
         activation_situ_beta: SituGLU activation beta
         activation_situ_linear_beta: SituGLU linear beta
         e_score_correction_bias: Expert score correction bias tensor
+        e_score_correction_bias_vl: Image-token expert-selection bias tensor
+        vl_vocab_size: Vocabulary boundary separating text and image token IDs
         apply_router_weight_on_input: Whether to apply router weights on input
         activation: Activation function name ("silu", "gelu", etc.)
         enable_eplb: Whether to enable expert parallelism load balancer
@@ -296,6 +300,8 @@ def FusedMoEFactory(
             if not apply_routed_scale_to_output
             else 1.0,
             e_score_correction_bias=e_score_correction_bias,
+            e_score_correction_bias_vl=e_score_correction_bias_vl,
+            vl_vocab_size=vl_vocab_size,
             num_fused_shared_experts=num_fused_shared_experts,
             # Fused shared-expert slot weight. With apply_routed_scale_to_output
             # the runner scales the combined output by routed_scaling_factor, so

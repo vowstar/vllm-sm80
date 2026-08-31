@@ -37,7 +37,7 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
-    fused_topk_bias,
+    fused_topk_bias_vl,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -788,6 +788,7 @@ class DeepseekV4MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
 
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.num_experts_per_tok
@@ -815,8 +816,10 @@ class DeepseekV4MoE(nn.Module):
         )
 
         self.gate.e_score_correction_bias = None
+        self.gate.bias_vl = None
         self.gate.tid2eid = None
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        has_vision = int(getattr(config, "vision_n_layers", 0)) > 0
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
@@ -831,8 +834,20 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
+            if has_vision:
+                # Present in the official checkpoint even though hash-based
+                # text routing does not use this bias for expert selection.
+                self.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                    requires_grad=False,
+                )
         elif getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        if has_vision:
+            self.gate.bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -966,7 +981,13 @@ class DeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
+            e_score_correction_bias=(
+                None
+                if self.gate.tid2eid is not None
+                else self.gate.e_score_correction_bias
+            ),
+            e_score_correction_bias_vl=self.gate.bias_vl,
+            vl_vocab_size=config.vocab_size if self.gate.bias_vl is not None else None,
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
@@ -986,19 +1007,25 @@ class DeepseekV4MoE(nn.Module):
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
+        topk_weights, topk_ids = fused_topk_bias_vl(
             hidden_states=hidden_states,
             gating_output=router_logits,
             scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
+            e_score_correction_bias=(
+                self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None
+            ),
             topk=self.n_activated_experts,
             renormalize=self.renormalize,
             indices_type=self.hash_indices_dtype,
             input_tokens=input_ids,
             hash_indices_table=self.gate.tid2eid,
             routed_scaling_factor=self.routed_scaling_factor,
+            e_score_correction_bias_vl=(
+                self.gate.bias_vl.data if self.gate.bias_vl is not None else None
+            ),
+            vl_vocab_size=self.vocab_size if self.gate.bias_vl is not None else None,
         )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None

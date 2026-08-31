@@ -290,6 +290,77 @@ def fused_topk_bias(
     )
 
 
+def fused_topk_bias_vl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    scoring_func: str,
+    e_score_correction_bias: torch.Tensor | None,
+    topk: int,
+    renormalize: bool,
+    indices_type: torch.dtype | None = None,
+    input_tokens: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias_vl: torch.Tensor | None = None,
+    vl_vocab_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route image tokens with a separate expert-selection bias.
+
+    Text tokens retain the existing score- or hash-based route. Image token IDs
+    are out of vocabulary, so hash routing replaces them with a safe ID before
+    indexing ``hash_indices_table``. The returned weights still come from the
+    original, unbiased scores, matching DeepSeek V4 Vision's reference router.
+    """
+    if e_score_correction_bias_vl is None or input_tokens is None:
+        return fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            indices_type=indices_type,
+            input_tokens=input_tokens,
+            hash_indices_table=hash_indices_table,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    if vl_vocab_size is None:
+        raise ValueError("vl_vocab_size is required for vision-aware MoE routing")
+
+    image_mask = input_tokens >= vl_vocab_size
+    safe_input_tokens = input_tokens.masked_fill(image_mask, 0)
+    # Hash routing ignores the normal text bias. Keeping it out also prevents
+    # the score-based DeepSeek V4 fast path from bypassing the hash table.
+    text_bias = None if hash_indices_table is not None else e_score_correction_bias
+    text_weights, text_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func=scoring_func,
+        e_score_correction_bias=text_bias,
+        topk=topk,
+        renormalize=renormalize,
+        indices_type=indices_type,
+        input_tokens=safe_input_tokens,
+        hash_indices_table=hash_indices_table,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    vision_weights, vision_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias_vl,
+        topk=topk,
+        renormalize=renormalize,
+        indices_type=indices_type,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    image_mask = image_mask.unsqueeze(-1)
+    return (
+        torch.where(image_mask, vision_weights, text_weights),
+        torch.where(image_mask, vision_ids, text_ids),
+    )
+
+
 class FusedTopKBiasRouter(BaseRouter):
     """Router using fused top-k with e_score_correction_bias."""
 
@@ -304,6 +375,8 @@ class FusedTopKBiasRouter(BaseRouter):
         *,
         scoring_func: str = "sigmoid",
         hash_indices_table: torch.Tensor | None = None,
+        e_score_correction_bias_vl: torch.Tensor | None = None,
+        vl_vocab_size: int | None = None,
         num_fused_shared_experts: int = 0,
         shared_expert_weight: float = 1.0,
     ):
@@ -318,6 +391,12 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
+        self.e_score_correction_bias_vl = e_score_correction_bias_vl
+        self.vl_vocab_size = vl_vocab_size
+        if e_score_correction_bias_vl is not None and vl_vocab_size is None:
+            raise ValueError(
+                "vl_vocab_size is required when e_score_correction_bias_vl is set"
+            )
         # Fused shared experts: append constant slots (ids immediately after
         # the routed experts, [global, global+n)) routed to by every token at
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
@@ -344,7 +423,7 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
-        topk_weights, topk_ids = fused_topk_bias(
+        topk_weights, topk_ids = fused_topk_bias_vl(
             hidden_states=hidden_states,
             gating_output=router_logits,
             scoring_func=self.scoring_func,
@@ -357,6 +436,12 @@ class FusedTopKBiasRouter(BaseRouter):
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            e_score_correction_bias_vl=(
+                self.e_score_correction_bias_vl.data
+                if self.e_score_correction_bias_vl is not None
+                else None
+            ),
+            vl_vocab_size=self.vl_vocab_size,
         )
 
         if self.num_fused_shared_experts > 0:

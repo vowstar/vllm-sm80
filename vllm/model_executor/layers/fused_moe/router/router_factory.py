@@ -52,6 +52,8 @@ def create_fused_moe_router(
     # grouped topk + fused topk bias parameters
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
+    e_score_correction_bias_vl: torch.Tensor | None = None,
+    vl_vocab_size: int | None = None,
     # custom routing parameters
     custom_routing_function: Callable | None = None,
     # eplb parameters
@@ -91,6 +93,8 @@ def create_fused_moe_router(
     Grouped topk and fused topk bias arguments:
         routed_scaling_factor: Scaling factor for routed weights
         e_score_correction_bias: Optional bias correction for expert scores
+        e_score_correction_bias_vl: Optional image-token expert-selection bias
+        vl_vocab_size: Vocabulary boundary separating text and image token IDs
 
     Custom routing arguments:
         custom_routing_function: Optional custom routing function
@@ -199,7 +203,11 @@ def create_fused_moe_router(
 
     assert scoring_func in ["sigmoid", "softmax", "sqrtsoftplus"]
 
-    if e_score_correction_bias is not None or hash_indices_table is not None:
+    if (
+        e_score_correction_bias is not None
+        or hash_indices_table is not None
+        or e_score_correction_bias_vl is not None
+    ):
         return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
@@ -209,6 +217,8 @@ def create_fused_moe_router(
             routed_scaling_factor=routed_scaling_factor,
             scoring_func=scoring_func,
             hash_indices_table=hash_indices_table,
+            e_score_correction_bias_vl=e_score_correction_bias_vl,
+            vl_vocab_size=vl_vocab_size,
             num_fused_shared_experts=num_fused_shared_experts,
             shared_expert_weight=shared_expert_weight,
         )
