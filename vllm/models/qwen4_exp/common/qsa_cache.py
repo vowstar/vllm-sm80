@@ -578,7 +578,11 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
-            self.compress_ratio = kv_cache_spec.compress_ratio
+            # Upstream renamed MLAAttentionSpec.compress_ratio to
+            # tokens_per_state; the DeepSeek indexer builder was adapted to the
+            # new name during the merge and this call site was not.
+            assert isinstance(kv_cache_spec.tokens_per_state, int)
+            self.compress_ratio = kv_cache_spec.tokens_per_state
         else:
             self.compress_ratio = 1
         self.storage_block_size = kv_cache_spec.storage_block_size

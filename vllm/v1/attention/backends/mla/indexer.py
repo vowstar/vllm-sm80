@@ -474,6 +474,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
+    # Compressed indexer coordinates: the uncompressed length lives on the
+    # enclosing DeepseekV32IndexerMetadata. The Triton decode fallback sizes
+    # its logits buffer from this one.
+    max_seq_len: int = 0
 
 
 @dataclass
@@ -1228,6 +1232,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
+                max_seq_len=(
+                    common_attn_metadata.max_seq_len // self.compress_ratio
+                ),
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
