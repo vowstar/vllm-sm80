@@ -55,14 +55,18 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
+    MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMultiModal,
     SupportsPP,
 )
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
@@ -76,12 +80,26 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.multimodal import (
+    IMAGE_PLACEHOLDER,
+    DeepseekV4VisionDummyInputsBuilder,
+    DeepseekV4VisionMultiModalProcessor,
+    DeepseekV4VisionProcessingInfo,
+)
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.vision import (
+    NUM_IMAGE_TOKEN_TYPES,
+    DeepseekV4VisionAligner,
+    DeepseekV4VisionTransformer,
+    apply_image_type_embeddings,
+    build_image_block,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer_moe_ep import (
@@ -1727,14 +1745,22 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    DeepseekV4VisionMultiModalProcessor,
+    info=DeepseekV4VisionProcessingInfo,
+    dummy_inputs=DeepseekV4VisionDummyInputsBuilder,
+)
 class DeepseekV4ForCausalLM(
     nn.Module,
     SupportsPP,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMultiModal,
     DeepseekV4MixtureOfExperts,
 ):
     model_cls = DeepseekV4Model
+    # Hash routing still consumes token IDs when vision embeddings are supplied.
+    requires_raw_input_tokens = True
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
@@ -1754,13 +1780,47 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.has_vision = int(getattr(config, "vision_n_layers", 0)) > 0
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
-        self.model = self.model_cls(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        with self._mark_language_model(vllm_config):
+            self.model = self.model_cls(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "model"),
+            )
+
+        if self.has_vision:
+            with self._mark_tower_model(vllm_config, "image"):
+                self.vision = DeepseekV4VisionTransformer(config)
+                self.aligner = DeepseekV4VisionAligner(config)
+            self.image_start = nn.Parameter(
+                torch.empty(config.hidden_size), requires_grad=False
+            )
+            self.image_end = nn.Parameter(
+                torch.empty(config.hidden_size), requires_grad=False
+            )
+            self.image_newline = nn.Parameter(
+                torch.empty(config.hidden_size), requires_grad=False
+            )
+            self.image_pad = nn.Parameter(
+                torch.empty(config.hidden_size), requires_grad=False
+            )
+            self.configure_mm_token_handling(
+                config.vocab_size,
+                [
+                    config.vocab_size + token_type
+                    for token_type in range(NUM_IMAGE_TOKEN_TYPES)
+                ],
+            )
+        else:
+            self.vision = None
+            self.aligner = None
+            self.image_start = None
+            self.image_end = None
+            self.image_newline = None
+            self.image_pad = None
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -1795,8 +1855,110 @@ class DeepseekV4ForCausalLM(
         self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        del i
+        if modality.startswith("image"):
+            return IMAGE_PLACEHOLDER
+        raise ValueError(f"Unsupported DeepSeek V4 modality: {modality}")
+
+    def _require_image_modules(
+        self,
+    ) -> tuple[DeepseekV4VisionTransformer, DeepseekV4VisionAligner]:
+        if self.vision is None or self.aligner is None:
+            raise ValueError("This DeepSeek V4 checkpoint has no vision tower")
+        return self.vision, self.aligner
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        pixel_values = kwargs.get("pixel_values")
+        image_grid_hws = kwargs.get("image_grid_hws")
+        if pixel_values is None and image_grid_hws is None:
+            return []
+        if pixel_values is None or image_grid_hws is None:
+            raise ValueError(
+                "DeepSeek V4 pixel_values and image_grid_hws must be provided together"
+            )
+        if not isinstance(image_grid_hws, torch.Tensor):
+            raise TypeError("DeepSeek V4 image_grid_hws must be a tensor")
+
+        if isinstance(pixel_values, torch.Tensor):
+            if pixel_values.ndim == 4:
+                images = [pixel_values]
+            elif pixel_values.ndim == 5:
+                images = list(pixel_values)
+            else:
+                raise ValueError("DeepSeek V4 pixel_values must be 4D or 5D")
+        elif isinstance(pixel_values, (list, tuple)):
+            images = list(pixel_values)
+        else:
+            raise TypeError("DeepSeek V4 pixel_values must be a tensor or sequence")
+        grids = image_grid_hws.reshape(-1, 2).tolist()
+        if len(images) != len(grids):
+            raise ValueError("DeepSeek V4 image pixels and grid metadata do not match")
+
+        vision, aligner = self._require_image_modules()
+        ratio = int(self.config.vision_downsample_ratio)
+        image_embeddings: list[torch.Tensor] = []
+        for patches, (n_vit_h, n_vit_w) in zip(images, grids):
+            if not isinstance(patches, torch.Tensor):
+                raise TypeError("DeepSeek V4 pixel_values must contain tensors")
+            n_vit_h, n_vit_w = int(n_vit_h), int(n_vit_w)
+            if patches.shape[0] != n_vit_h * n_vit_w:
+                raise ValueError("DeepSeek V4 patch count does not match its grid")
+            features = vision(patches, n_vit_h, n_vit_w)
+            features = aligner(features, n_vit_h, n_vit_w)
+            n_llm_h = (n_vit_h + ratio - 1) // ratio
+            n_llm_w = (n_vit_w + ratio - 1) // ratio
+            _, permutation = build_image_block(n_llm_h, n_llm_w, start_pos=3)
+            permutation = permutation.to(device=features.device)
+            image_embeddings.append(features.index_select(0, permutation))
+        return image_embeddings
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.has_vision:
+            return self.model.embed_input_ids(input_ids)
+
+        vocab_size = int(self.config.vocab_size)
+        token_types = input_ids - vocab_size
+        is_image_type = (token_types >= 0) & (token_types < NUM_IMAGE_TOKEN_TYPES)
+        safe_input_ids = input_ids.masked_fill(is_image_type, 0)
+        inputs_embeds = self.model.embed_input_ids(safe_input_ids)
+
+        assert self.image_start is not None
+        assert self.image_pad is not None
+        assert self.image_newline is not None
+        assert self.image_end is not None
+        image_type_embeddings = torch.stack(
+            [
+                self.image_start,
+                self.image_pad,
+                self.image_pad,
+                self.image_newline,
+                self.image_end,
+            ]
+        )
+        inputs_embeds = apply_image_type_embeddings(
+            inputs_embeds,
+            input_ids,
+            vocab_size,
+            image_type_embeddings,
+        )
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+        if is_multimodal is None:
+            raise ValueError("is_multimodal is required for image embeddings")
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def compute_logits(
         self,
@@ -1834,6 +1996,13 @@ class DeepseekV4ForCausalLM(
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
         return loaded_params
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        return MultiModelKeys.from_string_field(
+            language_model="model",
+            connector="aligner",
+            tower_model="vision",
+        )
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
