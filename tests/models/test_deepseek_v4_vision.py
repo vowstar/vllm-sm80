@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+
 from vllm.models.deepseek_v4.multimodal import _position_image_blocks
 from vllm.models.deepseek_v4.visibility import (
     get_image_swa_bounds,
