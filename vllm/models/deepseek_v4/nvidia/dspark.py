@@ -14,7 +14,6 @@ from collections.abc import Iterable
 import regex as re
 import torch
 import torch.nn as nn
-
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -50,6 +49,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 
+from ..vision import NUM_IMAGE_TOKEN_TYPES
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -77,6 +77,23 @@ def _require_pp_embedding_loaded(loaded_params: set[str], use_pp: bool) -> None:
             "Pipeline-parallel DeepSeek V4 DSpark did not load embed.weight "
             "into its last-rank local embedding"
         )
+
+
+def _map_image_token_ids_for_lookup(
+    input_ids: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
+    """Map only the five official image IDs to a valid embedding row.
+
+    DeepSeek V4 Vision represents image token types as ``vocab_size + [0, 4]``.
+    The target model replaces those rows with learned image-type embeddings,
+    but DSpark only needs a safe lookup value at a prefill boundary. Keep every
+    other out-of-vocabulary ID unchanged so malformed inputs still fail loudly.
+    This returns a new tensor and leaves the raw IDs available to vision-aware
+    MoE routing.
+    """
+    token_types = input_ids - vocab_size
+    is_image_type = (token_types >= 0) & (token_types < NUM_IMAGE_TOKEN_TYPES)
+    return input_ids.masked_fill(is_image_type, 0)
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -161,7 +178,10 @@ class DSparkDeepseekV4Model(nn.Module):
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        lookup_ids = _map_image_token_ids_for_lookup(
+            input_ids, int(self.config.vocab_size)
+        )
+        return self.embed_tokens(lookup_ids)
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux hidden states)).
@@ -387,7 +407,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return draft_ids  # full-vocab: draft ids are target ids
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.markov_head.embed(token_ids)
+        lookup_ids = _map_image_token_ids_for_lookup(
+            token_ids, int(self.config.vocab_size)
+        )
+        return self.model.markov_head.embed(lookup_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)

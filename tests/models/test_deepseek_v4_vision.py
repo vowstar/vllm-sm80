@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
-
 from vllm.models.deepseek_v4.multimodal import _position_image_blocks
 from vllm.models.deepseek_v4.visibility import (
     get_image_swa_bounds,
@@ -348,3 +347,56 @@ def test_pp_runtime_and_capture_keep_raw_image_token_ids() -> None:
         ]
         assert calls, f"{relative_path} dropped raw IDs on a non-first PP rank"
         assert any(ast.unparse(call.args[1]) == expected_buffer for call in calls)
+
+
+def test_dspark_maps_only_official_image_ids_for_embedding_lookups() -> None:
+    from vllm.models.deepseek_v4.nvidia.dspark import (
+        DSparkDeepseekV4ForCausalLM,
+        DSparkDeepseekV4Model,
+        _map_image_token_ids_for_lookup,
+    )
+
+    class CaptureEmbedding(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.last_ids: torch.Tensor | None = None
+
+        def forward(self, ids: torch.Tensor) -> torch.Tensor:
+            self.last_ids = ids.clone()
+            return torch.zeros((*ids.shape, 1))
+
+        def embed(self, ids: torch.Tensor) -> torch.Tensor:
+            return self(ids)
+
+    vocab_size = 100
+    raw_ids = torch.tensor([7, 100, 101, 102, 103, 104, 8])
+    expected_lookup_ids = torch.tensor([7, 0, 0, 0, 0, 0, 8])
+    original = raw_ids.clone()
+
+    mapped = _map_image_token_ids_for_lookup(raw_ids, vocab_size)
+    assert torch.equal(mapped, expected_lookup_ids)
+    assert torch.equal(raw_ids, original)
+
+    draft = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
+    torch.nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(vocab_size=vocab_size)
+    draft.embed_tokens = CaptureEmbedding()
+    draft.embed_input_ids(raw_ids)
+    assert torch.equal(draft.embed_tokens.last_ids, expected_lookup_ids)
+    assert torch.equal(raw_ids, original)
+
+    wrapper = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(vocab_size=vocab_size)
+    wrapper.model = torch.nn.Module()
+    wrapper.model.markov_head = CaptureEmbedding()
+    wrapper.markov_embed(raw_ids)
+    assert torch.equal(wrapper.model.markov_head.last_ids, expected_lookup_ids)
+    assert torch.equal(raw_ids, original)
+
+    invalid = torch.tensor([vocab_size + 5])
+    assert torch.equal(_map_image_token_ids_for_lookup(invalid, vocab_size), invalid)
+    with pytest.raises(IndexError):
+        torch.nn.Embedding(vocab_size, 1)(
+            _map_image_token_ids_for_lookup(invalid, vocab_size)
+        )
