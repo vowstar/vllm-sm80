@@ -583,23 +583,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec = spec.first_spec
             block_sizes.append(spec.block_size)
             slot_mapping_enabled.append(not isinstance(spec, CircularBufferSpec))
-            # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
-            if isinstance(spec, CircularBufferSpec):
-                max_num_blocks = spec.max_num_blocks_per_req(
-                    self.vllm_config, block_table_max_model_len
-                )
-            else:
-                max_num_blocks = cdiv(
-                    block_table_max_model_len, spec.block_size * self.dcp_size
-                )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
-            if isinstance(spec, MambaSpec):
-                max_num_blocks = get_block_table_width(
-                    max_num_blocks, spec.block_size, token_alignment=None
-                )
-            elif isinstance(spec, CircularBufferSpec):
+            # Let each cache type account for DCP, speculative state, and any
+            # topology-specific block-table requirements.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
+            )
+            # Recurrent and circular caches do not use token alignment when
+            # their logical block-table width is normalized.
+            if isinstance(spec, MambaSpec | CircularBufferSpec):
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
