@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import ClassVar, cast
 
+import numpy as np
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -15,6 +16,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTens
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -25,7 +27,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    fill_mm_prefix_query_ranges,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -171,6 +176,10 @@ class DeepseekSparseSWAMetadata:
         None  # [num_prefill_tokens, 1, window_size]
     )
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
+    # Absolute inclusive PrefixLM range for each scheduled prefill query token,
+    # or (-1, -1) outside image blocks. The SM8x gathered-prefill path uses this
+    # to widen only its SWA indices; compressed/top-k indices stay causal.
+    prefill_mm_query_ranges: torch.Tensor | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -475,6 +484,22 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
 
+        # PrefixLM ranges are resolved on CPU from scheduler-owned absolute
+        # positions, then copied into a persistent device buffer. Prefill is not
+        # CUDA-graphed, but fixed addresses keep this builder consistent with
+        # the other multimodal attention backends.
+        self.mm_prefix_query_ranges_cpu: torch.Tensor | None = None
+        self.mm_prefix_query_ranges_np: np.ndarray | None = None
+        self.mm_prefix_query_ranges_gpu: torch.Tensor | None = None
+        if self.vllm_config.model_config.is_mm_prefix_lm:
+            self.mm_prefix_query_ranges_cpu = torch.empty(
+                (max_tokens, 2), dtype=torch.int32, pin_memory=PIN_MEMORY
+            )
+            self.mm_prefix_query_ranges_np = self.mm_prefix_query_ranges_cpu.numpy()
+            self.mm_prefix_query_ranges_gpu = torch.empty(
+                (max_tokens, 2), dtype=torch.int32, device=self.device
+            )
+
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
         # so its per-token index list is wider than `window_size`. The kernel pads
@@ -605,6 +630,31 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 TRITON_BLOCK_SIZE=1024,
             )
 
+        prefill_mm_query_ranges = None
+        if (
+            num_prefill_tokens > 0
+            and common_attn_metadata.mm_req_doc_ranges is not None
+            and self.mm_prefix_query_ranges_np is not None
+        ):
+            assert seq_lens_cpu is not None
+            num_mm_tokens = fill_mm_prefix_query_ranges(
+                self.mm_prefix_query_ranges_np,
+                common_attn_metadata.mm_req_doc_ranges,
+                query_start_loc_cpu,
+                seq_lens_cpu,
+            )
+            if num_mm_tokens > 0:
+                assert self.mm_prefix_query_ranges_cpu is not None
+                assert self.mm_prefix_query_ranges_gpu is not None
+                mm_query_ranges = self.mm_prefix_query_ranges_gpu[:num_mm_tokens]
+                mm_query_ranges.copy_(
+                    self.mm_prefix_query_ranges_cpu[:num_mm_tokens],
+                    non_blocking=True,
+                )
+                prefill_mm_query_ranges = mm_query_ranges[
+                    num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                ]
+
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
             num_decodes,
@@ -642,6 +692,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 if num_prefill_tokens > 0
                 else None
             ),
+            prefill_mm_query_ranges=prefill_mm_query_ranges,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,

@@ -1788,6 +1788,9 @@ class DeepseekV4ForCausalLM(
     model_cls = DeepseekV4Model
     # Hash routing still consumes token IDs when vision embeddings are supplied.
     requires_raw_input_tokens = True
+    # START/PAD/IMAGE/NEWLINE/END all belong to the image-local PrefixLM span,
+    # although only IMAGE positions are replaced by tower embeddings.
+    mm_prefix_use_full_placeholder = True
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".

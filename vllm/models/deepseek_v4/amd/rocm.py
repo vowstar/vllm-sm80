@@ -106,11 +106,13 @@ def _combine_topk_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    mm_query_ranges_ptr,
     M,
     N,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
+    SWA_INDEX_WIDTH: tl.constexpr,
     TOPK_WIDTH: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
 ):
@@ -131,7 +133,21 @@ def _combine_topk_swa_indices_kernel(
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        swa_start = tl.maximum(pos - WINDOW_SIZE + 1, 0)
+        swa_end = pos + 1
+        if mm_query_ranges_ptr is not None:
+            mm_start = tl.load(mm_query_ranges_ptr + token_idx * 2)
+            mm_end = tl.load(mm_query_ranges_ptr + token_idx * 2 + 1)
+            has_mm_range = (mm_start >= 0) & (mm_start <= pos) & (pos <= mm_end)
+            swa_start = tl.where(
+                has_mm_range, tl.minimum(swa_start, mm_start), swa_start
+            )
+            swa_end = tl.where(
+                has_mm_range,
+                tl.minimum(seq_len, tl.maximum(swa_end, mm_end + 1)),
+                swa_end,
+            )
+        swa_len = swa_end - swa_start
 
         topk_offset = tl.arange(0, PADDED_TOP_K)
         topk_mask = topk_offset < topk_len
@@ -149,13 +165,13 @@ def _combine_topk_swa_indices_kernel(
             mask=topk_mask,
         )
 
-        swa_offset = tl.arange(0, WINDOW_SIZE)
+        swa_offset = tl.arange(0, SWA_INDEX_WIDTH)
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
             + topk_len
             + swa_offset,
-            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
+            M * batch_idx + N + swa_offset + swa_start - gather_start,
             mask=swa_offset < swa_len,
         )
 
@@ -172,12 +188,16 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    mm_query_ranges: torch.Tensor | None = None,
+    swa_index_width: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
+    if swa_index_width is None:
+        swa_index_width = window_size
     combined_topk = (
-        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        (topk + swa_index_width + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
@@ -201,11 +221,13 @@ def combine_topk_swa_indices(
         query_start_loc,
         seq_lens,
         gather_lens,
+        mm_query_ranges,
         M,
         N,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        SWA_INDEX_WIDTH=swa_index_width,
         TOPK_WIDTH=topk_indices.shape[-1],
         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
     )
@@ -975,6 +997,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            mm_query_ranges = swa_metadata.prefill_mm_query_ranges
+            mm_query_ranges_chunk = (
+                mm_query_ranges[query_start:query_end]
+                if mm_query_ranges is not None
+                else None
+            )
+
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
@@ -987,6 +1016,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 top_k,
                 M,
                 N,
+                mm_query_ranges=mm_query_ranges_chunk,
+                swa_index_width=(
+                    self.prefill_swa_width
+                    if mm_query_ranges_chunk is not None
+                    else self.window_size
+                ),
             )
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +10,10 @@ import torch
 from PIL import Image
 
 from vllm.models.deepseek_v4.multimodal import _position_image_blocks
+from vllm.models.deepseek_v4.visibility import (
+    get_image_swa_bounds,
+    get_max_image_swa_width,
+)
 from vllm.models.deepseek_v4.vision import (
     IMAGE,
     IMAGE_END,
@@ -21,6 +27,7 @@ from vllm.models.deepseek_v4.vision import (
     grid_tokens,
     preprocess_image,
 )
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.multimodal.processing.processor import PlaceholderFeaturesInfo
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
@@ -162,8 +169,96 @@ def test_config_exposes_vision_fields_without_enabling_text_checkpoints() -> Non
     vision_config = DeepseekV4Config(vision_n_layers=32, vision_max_n_token=384)
 
     assert text_config.vision_n_layers == 0
+    assert text_config.is_mm_prefix_lm is False
     assert vision_config.vision_n_layers == 32
     assert vision_config.vision_max_n_token == 384
+    assert vision_config.is_mm_prefix_lm is True
+
+
+def test_full_image_placeholder_and_swa_visibility_match_official_semantics() -> None:
+    types, _ = build_image_block(3, 2, start_pos=0)
+    assert set(types.tolist()) == {
+        IMAGE_START,
+        IMAGE_PAD,
+        IMAGE,
+        IMAGE_NEW_LINE,
+        IMAGE_END,
+    }
+
+    placeholder = PlaceholderRange(
+        offset=20,
+        length=len(types),
+        is_embed=types == IMAGE,
+    )
+    image_range = (placeholder.offset, placeholder.offset + placeholder.length - 1)
+
+    # The legacy/default range still contains only tower embedding positions.
+    assert placeholder.extract_embeds_range() != [image_range]
+    # Vision-Exp opts into the complete START..END block.
+    assert placeholder.extract_embeds_range(full_placeholder=True) == [image_range]
+
+    for position in range(image_range[0], image_range[1] + 1):
+        start, end = get_image_swa_bounds(position, 4, image_range, seq_len=64)
+        assert start <= image_range[0]
+        assert end > image_range[1]
+
+
+def test_image_swa_visibility_does_not_cross_images_or_widen_text() -> None:
+    window_size = 4
+    first = (8, 12)
+    second = (24, 28)
+
+    # Image queries see their own complete block, but not another image.
+    first_bounds = get_image_swa_bounds(10, window_size, first, seq_len=32)
+    assert first_bounds == (7, 13)
+    assert not (first_bounds[0] <= second[0] < first_bounds[1])
+
+    second_bounds = get_image_swa_bounds(26, window_size, second, seq_len=32)
+    assert second_bounds == (23, 29)
+    assert not (second_bounds[0] <= first[1] < second_bounds[1])
+
+    # Text between blocks remains exactly causal SWA, with no future visibility.
+    assert get_image_swa_bounds(18, window_size, None, seq_len=32) == (15, 19)
+
+
+def test_official_image_swa_width_is_power_of_two_for_triton() -> None:
+    assert get_max_image_swa_width(window_size=128, max_image_tokens=384) == 512
+    assert get_max_image_swa_width(window_size=128, max_image_tokens=0) == 128
+
+
+def test_ampere_image_ranges_do_not_change_compressed_topk_selection() -> None:
+    """Pin the production Triton kernel's split between causal top-k and SWA."""
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm"
+        / "models"
+        / "deepseek_v4"
+        / "amd"
+        / "rocm.py"
+    )
+    module = ast.parse(source_path.read_text())
+    kernel = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_combine_topk_swa_indices_kernel"
+    )
+    topk_assignment = next(
+        node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "topk_len"
+            for target in node.targets
+        )
+    )
+    referenced_names = {
+        node.id
+        for node in ast.walk(topk_assignment.value)
+        if isinstance(node, ast.Name)
+    }
+
+    assert referenced_names == {"COMPRESS_RATIO", "TOP_K", "pos", "tl"}
 
 
 def test_weight_mapper_preserves_official_vision_and_vl_router_names() -> None:

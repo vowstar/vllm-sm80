@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.visibility import get_max_image_swa_width
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -205,6 +206,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
+        self.max_image_tokens = (
+            int(config.vision_max_n_token)
+            if int(getattr(config, "vision_n_layers", 0)) > 0
+            else 0
+        )
+        # Official Vision-Exp reserves room for the causal SWA window plus one
+        # complete image-local bidirectional span.
+        self.prefill_swa_width = get_max_image_swa_width(
+            self.window_size, self.max_image_tokens
+        )
         # NOTE(zyongye) Compress ratio can't be 0
         # we do this for because MTP layer is not included
         # in the compress ratio list

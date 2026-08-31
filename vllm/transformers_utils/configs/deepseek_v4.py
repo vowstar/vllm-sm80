@@ -40,4 +40,8 @@ class DeepseekV4Config(PretrainedConfig):
         self.vision_max_n_token = vision_max_n_token
         self.vision_min_pixels = vision_min_pixels
         self.vision_max_wh_ratio = vision_max_wh_ratio
+        # The official Vision-Exp checkpoint makes every complete image token
+        # block bidirectional inside the otherwise-causal decoder attention.
+        # Text-only DeepSeek V4 checkpoints must keep the legacy causal path.
+        self.is_mm_prefix_lm = vision_n_layers > 0
         super().__init__(**kwargs)
