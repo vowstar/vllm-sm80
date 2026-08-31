@@ -2490,6 +2490,9 @@ class GPUModelRunner(
             _clamps_in_kernel = getattr(
                 self.model, "mm_prefix_clamp_sliding_window", False
             )
+            _use_full_placeholder = getattr(
+                self.model, "mm_prefix_use_full_placeholder", False
+            )
             for req_id in self.input_batch.req_ids:
                 image_doc_ranges = []
                 req_state = self.requests[req_id]
@@ -2497,10 +2500,13 @@ class GPUModelRunner(
                     if mm_feature.modality == "audio":
                         continue
                     pos_info = mm_feature.mm_position
-                    img_doc_range = pos_info.extract_embeds_range()
+                    img_doc_range = pos_info.extract_embeds_range(
+                        full_placeholder=_use_full_placeholder,
+                    )
                     for r in img_doc_range:
                         if (
                             not _clamps_in_kernel
+                            and not _use_full_placeholder
                             and _bidi_sw is not None
                             and (r[1] - r[0] + 1) > _bidi_sw
                         ):

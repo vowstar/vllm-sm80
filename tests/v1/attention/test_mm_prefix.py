@@ -19,11 +19,13 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
+from vllm.v1.worker.gpu.attn_utils import compute_mm_prefix_ranges
 
 
 def _fa4_available() -> bool:
@@ -77,6 +79,32 @@ SLIDING_WINDOW_LEFT = 129
 
 # Stands in for the builder's persistent (max_num_batched_tokens, 2) buffer.
 STAGING_CAPACITY = 64
+
+
+def test_full_placeholder_range_is_explicit_and_opt_in():
+    """The default keeps existing embed-only ranges byte-for-byte unchanged."""
+    position = PlaceholderRange(
+        offset=20,
+        length=7,
+        is_embed=torch.tensor([False, True, True, False, True, False, False]),
+    )
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image-0",
+        mm_position=position,
+    )
+    features = {"req-0": [feature]}
+
+    assert compute_mm_prefix_ranges(["req-0"], features, sliding_window=3) == {
+        0: [(21, 22), (24, 24)]
+    }
+    assert compute_mm_prefix_ranges(
+        ["req-0"],
+        features,
+        sliding_window=3,
+        use_full_placeholder=True,
+    ) == {0: [(20, 26)]}
 
 
 def _query_ranges(mm_ranges, query_lens, seq_lens):

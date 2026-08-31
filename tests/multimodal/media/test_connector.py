@@ -379,6 +379,17 @@ def test_placeholder_range_extract_embeds_range(offset, is_embed, expected):
     assert pr.extract_embeds_range() == expected
 
 
+def test_placeholder_range_extract_full_range_is_opt_in():
+    pr = PlaceholderRange(
+        offset=2,
+        length=5,
+        is_embed=torch.tensor([False, True, False, True, True]),
+    )
+
+    assert pr.extract_embeds_range() == [(3, 3), (5, 6)]
+    assert pr.extract_embeds_range(full_placeholder=True) == [(2, 6)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
 @pytest.mark.parametrize("num_frames", [-1, 32, 1800])

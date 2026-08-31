@@ -179,7 +179,11 @@ class PlaceholderRange:
 
         return embeds_start_idx, embeds_end_idx
 
-    def extract_embeds_range(self) -> list[tuple[int, int]]:
+    def extract_embeds_range(
+        self,
+        *,
+        full_placeholder: bool = False,
+    ) -> list[tuple[int, int]]:
         """Extract the start and end indices of the embedded region in prompt.
 
         For example, given `PlaceholderRange(offset=2, length=5)` and
@@ -190,8 +194,10 @@ class PlaceholderRange:
             A tuple `(start, end)` representing the start and end
             indices (inclusive) of the embedded region.
             Returns full placeholder range if `is_embed` is `None`.
+            If `full_placeholder` is true, returns the full range even when
+            only some positions receive multimodal embeddings.
         """
-        if self.is_embed is None:
+        if full_placeholder or self.is_embed is None:
             return [(self.offset, self.offset + self.length - 1)]
 
         mask_i = self.is_embed.int()

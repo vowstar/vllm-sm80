@@ -200,10 +200,14 @@ class DefaultModelState(ModelState):
             and self.encoder_cache is not None
             and self.model_config.is_mm_prefix_lm
         ):
+            use_full_placeholder = getattr(
+                self.model, "mm_prefix_use_full_placeholder", False
+            )
             req_doc_ranges = compute_mm_prefix_ranges(
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                use_full_placeholder=use_full_placeholder,
             )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
