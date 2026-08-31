@@ -403,6 +403,15 @@ class AttentionSpec(KVCacheSpec):
         return self.num_heads * self.num_states * self.state_content_size_bytes
 
     @property
+    def state_content_size_bytes(self) -> int:
+        return sum(
+            prod(shape) * get_dtype_size(dtype)
+            for (shape, dtype) in zip(self.shapes, self.dtypes)
+        )
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.state_content_size_bytes
+    @property
     def page_size_bytes(self) -> int:
         if self.page_size_padded is not None:
             assert self.page_size_padded >= self.unpadded_page_size_bytes
@@ -1001,7 +1010,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     kv_cache_specs: dict[str, KVCacheSpec]
 
-    @property
     num_prefill_checkpoint_blocks: int = 0
     num_heads: int = 1
     tokens_per_state: int = -1
