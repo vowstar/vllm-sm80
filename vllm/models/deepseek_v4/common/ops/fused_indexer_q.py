@@ -6,6 +6,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl, is_cutedsl_supported
+from vllm.v1.attention.ops.fp8_sm80 import _encode_fp8_u8
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -140,25 +141,26 @@ def _fused_indexer_q_rope_quant_kernel(
     index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
-    # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
-    # (e4m3fn) elsewhere -- matches the K cache.
-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+    # Store quantized values to index_q_fp8 as raw bytes. FNUZ (e4m3fnuz)
+    # on gfx942, OCP (e4m3fn) elsewhere -- matches the K cache. The encode is
+    # done in-register rather than through a Triton fp8 cast, because sm_80
+    # has neither fp8e4nv nor fp8e4b8.
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
         tl.store(
             fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
+            _encode_fp8_u8(tl.div_rn(x_nope, index_q_scale), USE_FNUZ),
         )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
     tl.store(
         fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
+        _encode_fp8_u8(tl.div_rn(r_even, index_q_scale), USE_FNUZ),
     )
     tl.store(
         fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
+        _encode_fp8_u8(tl.div_rn(r_odd, index_q_scale), USE_FNUZ),
     )
 
     # FP8 weight-fold contract:
@@ -461,7 +463,9 @@ def fused_indexer_q_rope_quant(
             index_q_cos_sin_cache,
             index_q_cos_sin_cache.stride(0),
             index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
+            # uint8 view: an fp8-typed pointer arg would make Triton reject
+            # the kernel below SM89; the kernel stores raw encoded bytes.
+            index_q_fp8.view(torch.uint8),
             index_q_fp8.stride(0),
             index_q_fp8.stride(1),
             index_q_head_dim,

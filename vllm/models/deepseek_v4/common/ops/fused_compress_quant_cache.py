@@ -26,6 +26,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -263,8 +264,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8 = _encode_e4m3fn_u8(x_clamped)
     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
     nope_mask = block < NOPE_HEAD_DIM
@@ -483,7 +483,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
     x_uint8 = tl.reshape(
-        x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+        _encode_e4m3fn_u8(x_clamped),
         (TRITON_BLOCK_SIZE,),
     )
     tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
@@ -837,8 +837,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8 = _encode_e4m3fn_u8(x_clamped)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
