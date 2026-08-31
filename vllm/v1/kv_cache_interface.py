@@ -164,6 +164,10 @@ class KVCacheSpec:
         raise NotImplementedError
 
     @property
+    def storage_block_size(self) -> int:
+        return self.block_size
+
+    @property
     def num_states(self) -> int:
         return self.get_num_kernel_states(self.block_size)
 
@@ -1018,6 +1022,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+
+    @property
+    def first_spec(self) -> KVCacheSpec:
+        """Return the first spec in the group."""
+        return next(iter(self.kv_cache_specs.values()))
 
     @property
     def page_size_bytes(self) -> int:

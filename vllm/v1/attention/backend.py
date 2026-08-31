@@ -102,6 +102,37 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
     @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently.
+
+        Probes get_kv_cache_shape with a sentinel block count and reports where
+        it lands. Backends that do not expose that shape -- most of them, since
+        it is no longer on this base class -- report 0, the common layout.
+        """
+        get_shape = getattr(cls, "get_kv_cache_shape", None)
+        if get_shape is None:
+            return 0
+        sentinel = 1234567
+        try:
+            shape = get_shape(
+                sentinel,
+                block_size,
+                num_kv_heads,
+                head_size,
+                cache_dtype_str=cache_dtype_str,
+            )
+            return tuple(shape).index(sentinel)
+        except (NotImplementedError, TypeError, ValueError):
+            return 0
+
+    @classmethod
     def supports_dtype(cls, dtype: torch.dtype) -> bool:
         return dtype in cls.supported_dtypes
 
