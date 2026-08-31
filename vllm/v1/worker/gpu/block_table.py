@@ -209,6 +209,7 @@ class BlockTables:
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
+            self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
             slot_mappings,
             slot_mappings.stride(0),
@@ -281,6 +282,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
+    kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
@@ -308,7 +310,8 @@ def _compute_slot_mappings_kernel(
 
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
-    block_size = tl.load(block_sizes + group_id)
+    kv_block_size = tl.load(block_sizes + group_id)
+    kernel_block_size = tl.load(kernel_block_sizes + group_id)
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
@@ -318,25 +321,36 @@ def _compute_slot_mappings_kernel(
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
-        block_indices = tl.where(
-            mapping_enabled, positions // (block_size * CP_SIZE), 0
-        )
-        block_offsets = positions % (block_size * CP_SIZE)
-        block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices
-        )
-
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
-            slot_ids = block_numbers * block_size + block_offsets
+            local_positions = positions
+            is_local = True
         else:
             # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = block_offsets % CP_INTERLEAVE
+            virtual_block_size = kv_block_size * CP_SIZE
+            virtual_block_indices = positions // virtual_block_size
+            virtual_block_offsets = positions % virtual_block_size
+            is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
+            rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
+            remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
-            slot_ids = block_numbers * block_size + local_offsets
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+            local_positions = virtual_block_indices * kv_block_size + local_offsets
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
-        tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+        block_indices = local_positions // kernel_block_size
+        block_offsets = local_positions % kernel_block_size
+        # Narrow side caches (for example GLM-5.3 KpoolTailSpec) may have a
+        # one-block table even though positions are raw model-token positions.
+        # Their metadata builder replaces this generic mapping, but this kernel
+        # must not read outside the row before that happens.
+        token_valid = offset < end_idx
+        in_range = (block_indices >= 0) & (block_indices < block_table_stride)
+        mapping_valid = token_valid & mapping_enabled & is_local & in_range
+        block_numbers = tl.load(
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            mask=mapping_valid,
+            other=0,
+        )
+        slot_ids = block_numbers * kernel_block_size + block_offsets
+        slot_ids = tl.where(mapping_valid, slot_ids, PAD_ID)
+
+        tl.store(slot_mapping_ptr + offset, slot_ids, mask=token_valid)

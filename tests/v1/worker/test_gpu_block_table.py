@@ -176,6 +176,42 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     assert torch.equal(actual, expected)
 
 
+def test_slot_mapping_masks_narrow_and_disabled_groups():
+    """Generic mapping must not read past a narrow side-cache table."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[256, 256],
+        max_num_reqs=1,
+        max_num_batched_tokens=1024,
+        max_num_blocks_per_group=[1, 1],
+        device=device,
+        kernel_block_sizes=[256, 256],
+        slot_mapping_enabled=[True, False],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([7], [9]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 1024], dtype=torch.int32, device=device)
+    positions = torch.arange(1024, dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=1024,
+    )
+
+    expected = torch.full((2, 1024), -1, dtype=torch.int64, device=device)
+    expected[0, :256] = torch.arange(
+        7 * 256, 8 * 256, dtype=torch.int64, device=device
+    )
+    assert torch.equal(actual, expected)
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows
