@@ -328,18 +328,15 @@ def _compute_slot_mappings_kernel(
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
-            local_positions = positions
-            is_local = True
+            slot_ids = block_numbers * block_size + block_offsets
         else:
             # Context parallelism is used.
-            virtual_block_size = kv_block_size * CP_SIZE
-            virtual_block_indices = positions // virtual_block_size
-            virtual_block_offsets = positions % virtual_block_size
-            is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = virtual_block_offsets % CP_INTERLEAVE
+            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
+            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
+            remainder = block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
-            local_positions = virtual_block_indices * kv_block_size + local_offsets
+            slot_ids = block_numbers * block_size + local_offsets
+            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
