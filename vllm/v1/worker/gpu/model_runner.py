@@ -47,7 +47,10 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+from vllm.model_executor.models.interfaces import (
+    requires_raw_input_tokens,
+    select_pp_input_ids,
+)
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -1748,7 +1751,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            model_inputs["input_ids"] = select_pp_input_ids(
+                self.model, input_batch.input_ids
+            )
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.

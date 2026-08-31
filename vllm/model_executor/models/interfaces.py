@@ -621,6 +621,13 @@ def requires_raw_input_tokens(model: type[object] | object) -> bool:
     return getattr(model, "requires_raw_input_tokens", False)
 
 
+def select_pp_input_ids(
+    model: type[object] | object, input_ids: Tensor
+) -> Tensor | None:
+    """Keep each PP worker's local fixed input buffer when the model needs IDs."""
+    return input_ids if requires_raw_input_tokens(model) else None
+
+
 def supports_multimodal_encoder_tp_data(model: type[object] | object) -> bool:
     return getattr(model, "supports_encoder_tp_data", False)
 

@@ -318,3 +318,33 @@ def test_dspark_pp_requires_aux_outputs_on_last_stage() -> None:
     )
     with pytest.raises(RuntimeError, match="every auxiliary output"):
         _validate_last_pp_stage_aux_layers(split, use_pp=True)
+
+
+def test_pp_runtime_and_capture_keep_raw_image_token_ids() -> None:
+    from vllm.model_executor.models.interfaces import select_pp_input_ids
+
+    raw_ids = torch.tensor([7, 100, 101, 102, 103, 104, 8])
+    vision_model = SimpleNamespace(requires_raw_input_tokens=True)
+    text_model = SimpleNamespace()
+
+    assert select_pp_input_ids(vision_model, raw_ids) is raw_ids
+    assert select_pp_input_ids(text_model, raw_ids) is None
+
+    repo_root = Path(__file__).parents[2]
+    expected_buffers = {
+        "vllm/v1/worker/gpu/model_runner.py": "input_batch.input_ids",
+        "vllm/v1/worker/gpu/cudagraph_utils.py": (
+            "input_buffers.input_ids[:num_tokens]"
+        ),
+    }
+    for relative_path, expected_buffer in expected_buffers.items():
+        tree = ast.parse((repo_root / relative_path).read_text())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "select_pp_input_ids"
+        ]
+        assert calls, f"{relative_path} dropped raw IDs on a non-first PP rank"
+        assert any(ast.unparse(call.args[1]) == expected_buffer for call in calls)

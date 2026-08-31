@@ -15,17 +15,27 @@ auto-clearing those when ``mask_mod`` is set; leaving ``causal=True`` would
 short out the mask_mod on SM90 and clip bidirectional ranges on SM100.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout
-from vllm.v1.worker.gpu.attn_utils import compute_mm_prefix_ranges
+from vllm.v1.worker.gpu.attn_utils import (
+    compute_mm_prefix_ranges,
+    reindex_mm_prefix_ranges,
+)
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
 
 def _fa4_available() -> bool:
@@ -105,6 +115,80 @@ def test_full_placeholder_range_is_explicit_and_opt_in():
         sliding_window=3,
         use_full_placeholder=True,
     ) == {0: [(20, 26)]}
+
+
+def test_mm_prefix_ranges_are_lightweight_on_every_pp_rank():
+    pixel_payload = MultiModalKwargsItem.dummy(nbytes=3 * 4 * 4)
+    position = PlaceholderRange(
+        offset=20,
+        length=7,
+        is_embed=torch.tensor([False, True, True, False, True, False, False]),
+    )
+    feature = MultiModalFeatureSpec(
+        data=pixel_payload,
+        modality="image",
+        identifier="image-0",
+        mm_position=position,
+    )
+    replacement = MultiModalFeatureSpec(
+        data=pixel_payload,
+        modality="image",
+        identifier="image-1",
+        mm_position=PlaceholderRange(
+            offset=40,
+            length=3,
+            is_embed=torch.tensor([False, True, False]),
+        ),
+    )
+
+    states = []
+    for _rank in range(4):
+        state = DefaultModelState.__new__(DefaultModelState)
+        state.mm_prefix_doc_ranges = {}
+        state.mm_prefix_use_full_placeholder = True
+        state.mm_prefix_sliding_window = 3
+        state.rope_state = None
+        state.prompt_embeds_state = None
+        state.add_request(
+            0,
+            SimpleNamespace(req_id="req-image", mm_features=[feature]),
+        )
+        assert state.mm_prefix_doc_ranges == {"req-image": [(20, 26)]}
+        assert all(
+            type(value) is int
+            for value in state.mm_prefix_doc_ranges["req-image"][0]
+        )
+        state.add_request(
+            0,
+            SimpleNamespace(req_id="req-image", mm_features=[replacement]),
+        )
+        assert state.mm_prefix_doc_ranges == {"req-image": [(40, 42)]}
+        states.append(state)
+
+    assert reindex_mm_prefix_ranges(
+        ["req-b", "req-text", "req-a"],
+        {"req-a": [(10, 12)], "req-b": [(30, 35)]},
+    ) == {0: [(30, 35)], 1: [], 2: [(10, 12)]}
+    capture_state = DefaultModelState.__new__(DefaultModelState)
+    capture_state.mm_prefix_doc_ranges = {}
+    assert capture_state._get_mm_prefix_doc_ranges(["capture-dummy"]) == {0: []}
+
+    for state in states:
+        state.remove_request("req-image")
+        assert state.mm_prefix_doc_ranges == {}
+
+
+def test_non_mm_model_state_does_not_retain_ranges():
+    state = DefaultModelState.__new__(DefaultModelState)
+    state.mm_prefix_doc_ranges = None
+    state.mm_prefix_use_full_placeholder = False
+    state.mm_prefix_sliding_window = None
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.add_request(0, SimpleNamespace(req_id="req-text", mm_features=[]))
+    assert state._get_mm_prefix_doc_ranges(["req-text"]) is None
+    state.remove_request("req-text")
+    assert state.mm_prefix_doc_ranges is None
 
 
 def _query_ranges(mm_ranges, query_lens, seq_lens):

@@ -11,7 +11,8 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
-    compute_mm_prefix_ranges,
+    extract_mm_prefix_ranges,
+    reindex_mm_prefix_ranges,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -61,7 +62,29 @@ class DefaultModelState(ModelState):
             self.model_config, model, self.rope_state, encoder_cache
         )
 
+        # Every PP rank receives NewRequestData, but only the first rank owns an
+        # EncoderCache. Keep only the small immutable ranges needed by target
+        # attention instead of retaining pixels or other multimodal payloads.
+        self.mm_prefix_doc_ranges: dict[str, list[tuple[int, int]]] | None = (
+            {} if self.model_config.is_mm_prefix_lm else None
+        )
+        self.mm_prefix_use_full_placeholder = bool(
+            self.mm_prefix_doc_ranges is not None
+            and getattr(model, "mm_prefix_use_full_placeholder", False)
+        )
+        self.mm_prefix_sliding_window = (
+            self.model_config.get_sliding_window()
+            if self.mm_prefix_doc_ranges is not None
+            else None
+        )
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        if self.mm_prefix_doc_ranges is not None:
+            self.mm_prefix_doc_ranges[new_req_data.req_id] = extract_mm_prefix_ranges(
+                new_req_data.mm_features,
+                sliding_window=self.mm_prefix_sliding_window,
+                use_full_placeholder=self.mm_prefix_use_full_placeholder,
+            )
         if self.rope_state is not None:
             assert new_req_data.prefill_token_ids is not None
             # `prompt_embeds` is a passthrough modality with no grid info, but
@@ -79,8 +102,17 @@ class DefaultModelState(ModelState):
             self.prompt_embeds_state.add_request(req_index, new_req_data)
 
     def remove_request(self, req_id: str) -> None:
+        if self.mm_prefix_doc_ranges is not None:
+            self.mm_prefix_doc_ranges.pop(req_id, None)
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
+
+    def _get_mm_prefix_doc_ranges(
+        self, req_ids: list[str]
+    ) -> dict[int, list[tuple[int, int]]] | None:
+        if self.mm_prefix_doc_ranges is None:
+            return None
+        return reindex_mm_prefix_ranges(req_ids, self.mm_prefix_doc_ranges)
 
     def apply_staged_writes(self) -> None:
         if self.rope_state is not None:
@@ -194,21 +226,7 @@ class DefaultModelState(ModelState):
             max_seq_len = self.max_model_len
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
-        req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
-        if (
-            self.supports_mm_inputs
-            and self.encoder_cache is not None
-            and self.model_config.is_mm_prefix_lm
-        ):
-            use_full_placeholder = getattr(
-                self.model, "mm_prefix_use_full_placeholder", False
-            )
-            req_doc_ranges = compute_mm_prefix_ranges(
-                req_ids=input_batch.req_ids,
-                mm_features=self.encoder_cache.mm_features,
-                sliding_window=self.model_config.get_sliding_window(),
-                use_full_placeholder=use_full_placeholder,
-            )
+        req_doc_ranges = self._get_mm_prefix_doc_ranges(input_batch.req_ids)
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
