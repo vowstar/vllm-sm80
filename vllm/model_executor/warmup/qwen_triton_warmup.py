@@ -342,23 +342,25 @@ def _warm_qsa_kernels(
         main_page_table_width, cache_block_size, num_q_heads, num_kv_heads,
         main_head_dim,
     )
-    # Triton specializes the mqa and splitk kernels on num_requests (the block
-    # table's request dim) at the exact value, so warm every batch size the
-    # scheduler can produce. A missed size JITs on its first request and, on a
+    # The indexer kernels carry do_not_specialize on their runtime row and
+    # request counts, so one launch per kernel compiles every reachable
+    # batch-size variant. The splitk kernel below still picks NUM_SPLITS /
+    # BLOCK_N from the batch shape, so it keeps the full batch-size walk. A
+    # missed specialization JITs on its first request and, on a
     # pipeline-parallel rank, can land inside a collective and deadlock.
     num_reqs_choices = tuple(range(1, 33))
     bf16 = torch.bfloat16
 
-    # Kernels 2+3: _qsa_mqa_paged_kernel and _expand_qsa_indices_kernel.
-    # rows <= 32 and rows > 32 select different TILES_PER_PROG specializations.
-    # columns = page_table_width * page_size (~8M here) would push the launch
-    # grid past CUDA's 65535 Y limit at rows <= 32. columns is a runtime arg,
-    # not a constexpr, so clamping it via num_columns keeps the grid legal
-    # without changing the compiled specialization.
+    # Kernels 2+3: the QSA indexer prefill scoring kernel and
+    # _expand_qsa_indices_kernel. The uniform decode scoring kernel is warmed
+    # separately by qwen4_exp_qsa_triton_warmup across every reachable
+    # decode-query-length specialization.
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        expand_qsa_block_indices_cuda,
-        qsa_mqa_paged,
         qsa_sparse_paged_attention,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
+        expand_qsa_block_indices_cuda,
+        qsa_mqa_paged_prefill,
     )
 
     block_topk = token_topk // compress_ratio
@@ -366,39 +368,37 @@ def _warm_qsa_kernels(
         "QSA mqa warmup: comp_cache %s dtype=%s; comp page_table w=%d.",
         tuple(comp_cache.shape), comp_cache.dtype, comp_page_table_width,
     )
-    for num_reqs in num_reqs_choices:
-        for rows in (1, 33):
-            q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
-            page_table = torch.zeros(
-                (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
-            )
-            token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-            # query_positions is logical_positions on the real path, int64.
-            query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
-            sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
-            qsa_mqa_paged(
-                q,
-                comp_cache,
-                page_table,
-                token_to_req,
-                query_positions,
-                sequence_lengths,
-                compress_ratio,
-                num_columns=4096,
-            )
-            block_indices = torch.zeros(
-                (rows, block_topk), dtype=torch.int32, device=device
-            )
-            out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
-            expand_qsa_block_indices_cuda(
-                block_indices,
-                query_positions,
-                sequence_lengths,
-                token_to_req,
-                compress_ratio,
-                token_topk,
-                out,
-            )
+    for num_reqs, rows in ((1, 1), (32, 33)):
+        q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
+        page_table = torch.zeros(
+            (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
+        )
+        token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+        # query_positions is logical_positions on the real path, int64.
+        query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        qsa_mqa_paged_prefill(
+            q,
+            comp_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+        )
+        block_indices = torch.zeros(
+            (rows, block_topk), dtype=torch.int32, device=device
+        )
+        out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
+        expand_qsa_block_indices_cuda(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
 
     # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
     # are picked from base_programs = rows * num_kv_heads, so walk every
