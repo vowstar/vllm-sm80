@@ -131,6 +131,7 @@ def test_dspark_mla_uses_latent_kv_geometry(
     assert model_config.get_num_experts() == 0
 
 
+@pytest.mark.skip_global_cleanup
 def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
@@ -139,15 +140,21 @@ def test_dspark_mla_speculative_config_preserves_architecture(tmp_path):
     target_config = ModelConfig(
         model=str(target_path), tokenizer_mode="skip", max_model_len=32768
     )
+    target_parallel_config = ParallelConfig(
+        pipeline_parallel_size=4,
+        distributed_executor_backend="external_launcher",
+    )
     speculative_config = SpeculativeConfig(
         model=str(draft_path),
         method="dspark",
         num_speculative_tokens=8,
         target_model_config=target_config,
-        target_parallel_config=ParallelConfig(),
+        target_parallel_config=target_parallel_config,
     )
 
     assert speculative_config.parallel_drafting
     assert speculative_config.draft_model_config.architectures == ["K3DSparkModel"]
     assert speculative_config.draft_model_config.hf_config.model_type == "k3_dspark"
     assert speculative_config.draft_model_config.use_mla
+    assert target_parallel_config.pipeline_parallel_size == 4
+    assert speculative_config.draft_parallel_config.pipeline_parallel_size == 1

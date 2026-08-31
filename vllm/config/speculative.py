@@ -1501,6 +1501,10 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+                # A DSpark drafter is built as one complete model on the target's
+                # last PP rank. It does not itself participate in target PP.
+                if self.method == "dspark":
+                    self.draft_parallel_config.pipeline_parallel_size = 1
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:

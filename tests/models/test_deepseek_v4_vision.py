@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -282,3 +283,38 @@ def test_weight_mapper_preserves_official_vision_and_vl_router_names() -> None:
         "image_start",
         "model.layers.3.ffn.gate.bias_vl",
     ]
+
+
+def test_dspark_pp_keeps_a_local_copy_of_the_target_embedding() -> None:
+    from vllm.models.deepseek_v4.nvidia.dspark import (
+        _remap_pp_owned_dspark_weight,
+        _require_pp_embedding_loaded,
+    )
+
+    assert _remap_pp_owned_dspark_weight("embed.weight", use_pp=True) == (
+        "model.embed_tokens.weight"
+    )
+    assert _remap_pp_owned_dspark_weight("embed.weight", use_pp=False) is None
+    assert _remap_pp_owned_dspark_weight("layers.0.attn.wq_a.weight", True) is None
+    _require_pp_embedding_loaded({"model.embed_tokens.weight"}, use_pp=True)
+    with pytest.raises(RuntimeError, match="did not load embed.weight"):
+        _require_pp_embedding_loaded(set(), use_pp=True)
+
+
+def test_dspark_pp_requires_aux_outputs_on_last_stage() -> None:
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+        _validate_last_pp_stage_aux_layers,
+    )
+
+    valid = SimpleNamespace(
+        aux_hidden_state_layers=(41, 42, 43), start_layer=36, end_layer=43
+    )
+    _validate_last_pp_stage_aux_layers(valid, use_pp=True)
+
+    split = SimpleNamespace(
+        aux_hidden_state_layers=(41, 42, 43), start_layer=42, end_layer=43
+    )
+    with pytest.raises(RuntimeError, match="every auxiliary output"):
+        _validate_last_pp_stage_aux_layers(split, use_pp=True)

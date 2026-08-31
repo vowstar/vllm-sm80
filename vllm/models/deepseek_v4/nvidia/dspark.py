@@ -18,6 +18,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -61,6 +62,21 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+
+
+def _remap_pp_owned_dspark_weight(name: str, use_pp: bool) -> str | None:
+    if use_pp and name == "embed.weight":
+        return "model.embed_tokens.weight"
+    return None
+
+
+def _require_pp_embedding_loaded(loaded_params: set[str], use_pp: bool) -> None:
+    embed_name = "model.embed_tokens.weight"
+    if use_pp and embed_name not in loaded_params:
+        raise RuntimeError(
+            "Pipeline-parallel DeepSeek V4 DSpark did not load embed.weight "
+            "into its last-rank local embedding"
+        )
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -300,8 +316,8 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
-    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # The lm_head is always shared with the target. The embedding is also shared
+    # without PP; under PP the last-rank drafter loads embed.weight locally.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -388,8 +404,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        Most non-mtp weights belong to the target model and are skipped. Under PP,
+        ``embed.weight`` is loaded into the drafter because the target embedding
+        exists only on the first rank. ``lm_head`` remains aliased from the target.
         """
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
@@ -429,8 +446,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_start = n_local_head * tp_rank
         head_end = n_local_head * (tp_rank + 1)
 
+        load_own_embed = get_pp_group().world_size > 1
         for name, loaded_weight in weights:
-            mapped = self._remap_dspark_name(name)
+            # Under PP the drafter exists only on the last rank, while the
+            # target embedding exists only on the first. Keep and load the
+            # drafter's local copy instead of trying to alias a PPMissingLayer.
+            mapped = _remap_pp_owned_dspark_weight(name, load_own_embed)
+            if mapped is None:
+                mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue
             name = mapped
@@ -504,6 +527,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        _require_pp_embedding_loaded(loaded_params, load_own_embed)
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         self.process_weights_after_loading()
