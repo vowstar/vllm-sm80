@@ -1028,6 +1028,25 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        # SM8x has neither FlashMLA nor fp8e4nv; the Triton path is the only
+        # one that compiles. TRITON_MLA_SPARSE_DSV4 may not be a registry
+        # member in this tree, so match it by name rather than by enum.
+        if backend is not None and backend.name != "TRITON_MLA_SPARSE_DSV4":
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
+                "use TRITON_MLA_SPARSE_DSV4 (default)."
+            )
+        if vllm_config.attention_config.use_fp4_indexer_cache:
+            raise ValueError(
+                "attention_config.use_fp4_indexer_cache requires SM100; "
+                "the MXFP4 indexer kernels emit Blackwell-only PTX."
+            )
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
