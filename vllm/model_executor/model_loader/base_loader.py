@@ -77,7 +77,34 @@ class BaseModelLoader(ABC):
             if _has_online_quant(model):
                 finalize_layerwise_processing(model, model_config)
 
-            process_weights_after_loading(model, model_config, target_device)
+            # VLLM_SERIALIZE_QUANT_CONVERT=1
+            # serializes the quant conversion phase across ranks. The NVFP4
+            # Marlin MoE repack IMAs (Xid 31 MMU region violation) only when
+            # all PP workers convert concurrently; bare repros never crash.
+            import os as _os
+            if _os.environ.get("VLLM_SERIALIZE_QUANT_CONVERT", "0") == "1":
+                import torch.distributed as _dist
+                if _dist.is_available() and _dist.is_initialized():
+                    _rank = _dist.get_rank()
+                    _world = _dist.get_world_size()
+                    if _rank > 0:
+                        logger.info(
+                            "SERIALIZE-CONVERT: rank %d waiting for rank %d",
+                            _rank, _rank - 1)
+                        _dist.barrier()
+                    logger.info("SERIALIZE-CONVERT: rank %d converting", _rank)
+                    process_weights_after_loading(model, model_config,
+                                                  target_device)
+                    torch.cuda.synchronize()
+                    if _rank < _world - 1:
+                        _dist.barrier()
+                    logger.info("SERIALIZE-CONVERT: rank %d done", _rank)
+                else:
+                    process_weights_after_loading(model, model_config,
+                                                  target_device)
+            else:
+                process_weights_after_loading(model, model_config,
+                                              target_device)
 
         return model.eval()
 

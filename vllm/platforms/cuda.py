@@ -133,13 +133,55 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
+            # Prefer FlashInfer FA3 for GLM-5.3-Flash NoPE sparse MLA on SM90;
+            # its feature gate falls through to the other sparse backends when
+            # unsupported. RoPE sparse models retain their existing order.
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            hf = (
+                cfg.model_config.hf_text_config
+                if cfg is not None and cfg.model_config is not None
+                else None
+            )
+            prefer_fi_sm90 = (
+                hf is not None
+                and getattr(hf, "qk_rope_head_dim", None) == 0
+                and getattr(hf, "index_topk", None) is not None
+            )
+            sparse_tail = [
+                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+                AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+            ]
+            # last-resort sparse MLA backend.
+            # The three in sparse_tail are all gated sm_90+, so on sm_80
+            # (A100/CMP 170HX) this pure-Triton backend is the only one that
+            # passes validation; on sm_90 it stays last and never wins over
+            # the native kernels. Appended at the RETURN sites, NOT inside
+            # sparse_tail: the prefer_fi_sm90 branch below does
+            # sparse_tail.pop() assuming FLASHINFER_MLA_SPARSE_SM90 is the
+            # last entry — appending inside the list made the pop remove
+            # TRITON_MLA_SPARSE instead (first GLM PP5 launch attempt died
+            # with "No valid attention backend found").
+            if prefer_fi_sm90:
+                sparse_tail.pop()  # dedupe the head entry
+                return [
+                    AttentionBackendEnum.FLASH_ATTN_MLA,
+                    AttentionBackendEnum.FLASHMLA,
+                    AttentionBackendEnum.FLASHINFER_MLA,
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+                    *sparse_tail,
+                    AttentionBackendEnum.TRITON_MLA_SPARSE,
+                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
-                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
-                AttentionBackendEnum.FLASHMLA_SPARSE,
+                *sparse_tail,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
@@ -399,6 +441,20 @@ class CudaPlatformBase(Platform):
                 )
 
         return valid_backends_priorities, invalid_reasons
+
+    @classmethod
+    def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        index_kpool = getattr(
+            vllm_config.model_config.hf_text_config, "index_kpool", None
+        )
+        if not index_kpool or index_kpool <= 1:
+            return None
+        from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+
+        # kpool paged-MQA indexer: the storage block (block_size /
+        # index_kpool) is virtually split into pool pages, so block_size
+        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
+        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
 
     @classmethod
     def get_attn_backend_cls(

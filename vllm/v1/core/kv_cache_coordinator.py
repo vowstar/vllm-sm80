@@ -157,6 +157,13 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
+    @property
+    def eagle_reach_margin(self) -> int:
+        """Tokens an EAGLE/MTP lookup drops below the deepest cached
+        position (the attention groups pruned block). 0 without speculative
+        decoding or without a pruned attention group."""
+        return 0
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -598,8 +605,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
+        # Only groups that participate in prefix caching must satisfy the
+        # divisibility constraint; groups that opt out (e.g. GLM-5.3-Flash kpool
+        # tail, block_size=kpool) are scratch buffers and excluded.
         group_block_sizes = [
-            manager.block_size for manager in self.single_type_managers
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.participates_in_prefix_caching
         ]
         assert all(
             block_size % hash_block_size == 0 for block_size in group_block_sizes
@@ -650,6 +664,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
         self.verify_and_split_kv_cache_groups()
+        # Sparse retention (`MambaManager._reachable_boundaries`) must keep a
+        # state where a pruned speculative lookup can reach, not only at the
+        # replay boundary.
+        for manager in self.single_type_managers:
+            manager.eagle_reach_margin = self.eagle_reach_margin
+
+    def _eagle_margin(
+        self, manager_cls: type[SingleTypeKVCacheManager], group_block_size: int
+    ) -> int:
+        """Tokens the EAGLE/MTP lookup drops from a group's hit: one hash
+        block under fine-grained partial hits, otherwise one group block."""
+        return (
+            self.hash_block_size
+            if self.enable_partial_hash_hits
+            and manager_cls.supports_fine_grained_hash_lookup
+            and group_block_size > self.hash_block_size
+            else group_block_size
+        )
+
+    @property
+    def eagle_reach_margin(self) -> int:
+        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
+            if use_eagle and not isinstance(spec, MambaSpec):
+                return self._eagle_margin(
+                    manager_cls, self.single_type_managers[group_ids[0]].block_size
+                )
+        return 0
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -668,6 +709,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
+            # kpool tail): their blocks are per-request scratch, never
+            # shareable, so they must not participate in hit lookup (their
+            # manager-level hooks already no-op). Their slot in the per-group
+            # hit tuple stays empty.
+            if not g.kv_cache_spec.participates_in_prefix_caching:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
@@ -825,13 +873,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = (
-                        self.hash_block_size
-                        if self.enable_partial_hash_hits
-                        and manager_cls.supports_fine_grained_hash_lookup
-                        and group_block_size > self.hash_block_size
-                        else group_block_size
-                    )
+                    eagle_margin = self._eagle_margin(manager_cls, group_block_size)
                     _max_length = min(
                         curr_hit_length + eagle_margin, max_cache_hit_length
                     )
@@ -886,6 +928,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        # APCDIAG: per-group hit visibility
+        import os as _os
+        if _os.environ.get("VLLM_APC_DIAG", "0") == "1" and max_cache_hit_length > 50000:
+            logger.warning(
+                "APCDIAG hit: max=%d final=%d uncached=%d groups=%s",
+                max_cache_hit_length, hit_length,
+                num_uncached_common_prefix_tokens,
+                [hit_length_by_group[i] if hit_blocks_by_group[i] is not None
+                 else -1 for i in range(num_groups)])
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

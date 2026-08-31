@@ -316,10 +316,38 @@ def _repack_marlin_experts(
     is_a_8bit: bool,
 ) -> torch.Tensor:
     """Repack each expert to marlin format into a preallocated output."""
+    # VLLM_MARLIN_REPACK_DEBUG=1 adds
+    # per-step sync + pointer dumps to pinpoint the sm_80 IMA (Xid 31)
+    # that only reproduces inside vLLM workers, never in bare scripts.
+    import os as _os
+    _dbg = _os.environ.get("VLLM_MARLIN_REPACK_DEBUG", "0") == "1"
+
+    def _info(t: torch.Tensor) -> str:
+        return (f"ptr={t.data_ptr():#x} shape={tuple(t.shape)} "
+                f"stride={tuple(t.stride())} dtype={t.dtype} "
+                f"dev={t.device} off={t.storage_offset()} "
+                f"contig={t.is_contiguous()}")
+
+    # VLLM_MARLIN_REPACK_HOLDOFF=1 works
+    # around a driver/allocator interaction on CMP 170HX (610.43.02) where
+    # writes into caching-allocator-reused VA blocks intermittently fault
+    # with Xid 31 MMU region violations. Flush cached blocks before the
+    # loop and hold every temporary alive until the end so no VA block is
+    # freed and reused while the repack kernels run.
+    _holdoff = _os.environ.get("VLLM_MARLIN_REPACK_HOLDOFF", "0") == "1"
+    _keep: list[torch.Tensor] | None = [] if _holdoff else None
+    if _holdoff:
+        torch.cuda.empty_cache()
+
     num_experts = weight.shape[0]
     out: torch.Tensor | None = None
     for i in range(num_experts):
+        if _dbg and i < 4:
+            logger.warning("REPACKDBG in[%d] %s", i, _info(weight[i]))
         qweight = weight[i].view(torch.int32).T.contiguous()
+        if _dbg and i < 4:
+            torch.cuda.synchronize()
+            logger.warning("REPACKDBG qw[%d] %s", i, _info(qweight))
         marlin_qweight = ops.gptq_marlin_repack(
             b_q_weight=qweight,
             perm=perm,
@@ -328,14 +356,39 @@ def _repack_marlin_experts(
             num_bits=4,
             is_a_8bit=is_a_8bit,
         )
+        if _keep is not None:
+            _keep.append(qweight)
+            _keep.append(marlin_qweight)
+        if _dbg:
+            torch.cuda.synchronize()
+            if i < 4:
+                logger.warning("REPACKDBG mq[%d] %s", i,
+                               _info(marlin_qweight))
         if out is None:
             out = torch.empty(
                 (num_experts, *marlin_qweight.shape),
                 dtype=marlin_qweight.dtype,
                 device=marlin_qweight.device,
             )
+            if _dbg:
+                logger.warning("REPACKDBG out %s", _info(out))
+        if _dbg:
+            torch.cuda.synchronize()
         out[i] = marlin_qweight
+        if _holdoff:
+            # The per-iteration sync is load-bearing, not decorative:
+            # without it the loop crashes again (verified 2026-08-28).
+            # It prevents new VA mappings (fresh cudaMallocs after the
+            # entry empty_cache) from racing in-flight repack kernels.
+            torch.cuda.synchronize()
+        if _dbg:
+            torch.cuda.synchronize()
+            if i % 32 == 0 or i == num_experts - 1:
+                logger.warning("REPACKDBG copy[%d] ok", i)
     assert out is not None
+    if _keep is not None:
+        _keep.clear()
+        torch.cuda.empty_cache()
     return out
 
 

@@ -175,10 +175,38 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # (vllm#42948 family):
+        # Split free blocks into an uncached tier and a cached tier.
+        # Allocation draws uncached first, so live cache entries are
+        # destroyed only at genuine pool pressure. Cached blocks form a
+        # single FIFO: provenance does not outrank recency (a separate
+        # hit-proven tier was removed because it locked stale content out
+        # of circulation under continuous load).
+        #
+        # Keep the cached tier under the historical `free_block_queue`
+        # name because simple KV offload walks that queue for eviction
+        # candidates. `free_queue_hot` stays allocated but unused so the
+        # shared queue bookkeeping keeps working.
+        self.free_queue_uncached = FreeKVCacheBlockQueue(self.blocks)
+        for block in self.blocks:
+            block.apcfix_q = 1
+        self.free_block_queue = FreeKVCacheBlockQueue([])
+        self.free_queue_hot = FreeKVCacheBlockQueue([])
+
+        # Un-hashed headroom. A brim-full working set still needs transient
+        # blocks that carry no hash: mamba running-state copies during
+        # prefill and decode, and the probe-time state allocations of a
+        # cache hit. If every free block is hashed, those transient
+        # allocations evict the cold tier head, which after a full
+        # working-set swap is the newest working set's own oldest chain,
+        # and the resulting miss re-prefills and cascades through every
+        # cached stream. VLLM_APC_HEADROOM_BLOCKS keeps at least this many
+        # blocks un-hashed (default 32, 0 disables) by evicting the oldest
+        # cold-tier hashes early.
+        import os as _os
+        self._apc_headroom_blocks = max(
+            0, int(_os.environ.get("VLLM_APC_HEADROOM_BLOCKS", "32"))
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -187,13 +215,50 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = self.free_queue_uncached.popleft()
+        self.null_block.apcfix_q = 0
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def _popleft_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop raw free blocks in tier order, without refcount handling."""
+        ret: list[KVCacheBlock] = []
+        remaining = num_blocks
+        for src_q, queue in enumerate(
+            (
+                self.free_queue_uncached,
+                self.free_block_queue,
+                self.free_queue_hot,
+            ),
+            start=1,
+        ):
+            if remaining == 0:
+                break
+            take = min(remaining, queue.num_free_blocks)
+            if take > 0:
+                popped = queue.popleft_n(take)
+                # APCDIAG: remember the source tier so the eviction log can
+                # show it (apcfix_q itself is cleared below).
+                for block in popped:
+                    block._apcdiag_src_q = src_q
+                ret.extend(popped)
+                remaining -= take
+        for block in ret:
+            block.apcfix_q = 0
+        return ret
+
+    def _apcfix_queue_for(self, block: KVCacheBlock) -> FreeKVCacheBlockQueue:
+        """Return the free queue currently holding ``block``."""
+        if block.apcfix_q == 1:
+            return self.free_queue_uncached
+        if block.apcfix_q == 3:
+            return self.free_queue_hot
+        # 2 (and any unexpected value) lives in the cold cached queue.
+        return self.free_block_queue
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,7 +723,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = self._popleft_free_blocks(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -692,6 +757,16 @@ class BlockPool:
             self.metrics_collector.on_block_evicted(block)
 
         evicted_hashes = self._remove_cached_block_hashes(block)
+        # APCDIAG: count hash evictions
+        import os as _os
+        if evicted_hashes and _os.environ.get("VLLM_APC_DIAG", "0") == "1":
+            BlockPool._apcdiag_evict_count = (
+                getattr(BlockPool, "_apcdiag_evict_count", 0) + 1)
+            n = BlockPool._apcdiag_evict_count
+            logger.warning(
+                "APCDIAG evict #%d: block=%s removed %d hash(es), src=%d",
+                n, block.block_id, len(evicted_hashes),
+                getattr(block, "_apcdiag_src_q", -1))
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
@@ -708,11 +783,17 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
+            # ref_cnt=0 means this block is in a free queue (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                self._apcfix_queue_for(block).remove(block)
+                block.apcfix_q = 0
             block.ref_cnt += 1
+            if not block.is_null:
+                # A touch is a proven prefix-cache hit. The flag no longer
+                # changes eviction order (single FIFO now), it only records
+                # reuse provenance for diagnostics.
+                block.apcfix_hit = True
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -729,8 +810,8 @@ class BlockPool:
                 priority.
         """
         # Identify blocks with hash (LRU cache) and without it (never match APC)
-        blocks_to_evict_last = []
-        blocks_to_evict_first = []
+        blocks_to_evict_last: list[KVCacheBlock] = []
+        blocks_to_evict_first: list[KVCacheBlock] = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
@@ -739,12 +820,51 @@ class BlockPool:
                     blocks_to_evict_first.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
+                    # Provenance does not outrank recency: a former
+                    # hit-proven tier locked stale proven content out of
+                    # circulation under continuous load, because cold is
+                    # never empty and the hot tier was never popped.
                     blocks_to_evict_last.append(block)
 
-        # Blocks to reuse first are prepended to the front of the free queue.
-        self.free_block_queue.prepend_n(blocks_to_evict_first)
-        # Blocks to reuse last are appended to the end of the free queue.
+        for block in blocks_to_evict_first:
+            block.apcfix_q = 1
+        self.free_queue_uncached.prepend_n(blocks_to_evict_first)
+        for block in blocks_to_evict_last:
+            block.apcfix_q = 2
         self.free_block_queue.append_n(blocks_to_evict_last)
+        self._apc_enforce_headroom()
+
+    def _apc_enforce_headroom(self) -> None:
+        """Keep at least ``_apc_headroom_blocks`` un-hashed blocks in the
+        uncached tier by evicting the oldest cached hashes early.
+
+        Victims come from the cold tier head, which matches the normal
+        allocation order. Evicted blocks move to the uncached tier, so
+        transient allocations (mamba state copies, probe-time running
+        state) never need to evict a hash.
+        """
+        if self._apc_headroom_blocks <= 0:
+            return
+        while self.free_queue_uncached.num_free_blocks < self._apc_headroom_blocks:
+            if self.free_block_queue.num_free_blocks > 0:
+                block = self.free_block_queue.popleft_n(1)[0]
+            elif self.free_queue_hot.num_free_blocks > 0:
+                block = self.free_queue_hot.popleft_n(1)[0]
+            else:
+                break
+            self._maybe_evict_cached_block(block)
+            block.apcfix_q = 1
+            self.free_queue_uncached.prepend_n([block])
+
+            import os as _os
+            if _os.environ.get("VLLM_APC_DIAG", "0") == "1":
+                logger.warning(
+                    "APCDIAG headroom: evicted block=%s early, "
+                    "uncached=%d cold=%d",
+                    block.block_id,
+                    self.free_queue_uncached.num_free_blocks,
+                    self.free_block_queue.num_free_blocks,
+                )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -807,7 +927,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_queue_uncached.num_free_blocks
+            + self.free_block_queue.num_free_blocks
+            + self.free_queue_hot.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

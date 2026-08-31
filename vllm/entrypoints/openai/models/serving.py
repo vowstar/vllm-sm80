@@ -69,6 +69,9 @@ class OpenAIModelRegistry:
                 ModelCard(
                     id=base_model.name,
                     max_model_len=max_model_len,
+                    # Advertise the spelling consumed by some
+                    # OpenAI-compatible clients.
+                    context_window=max_model_len,
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )

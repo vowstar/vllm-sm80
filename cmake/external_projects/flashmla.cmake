@@ -18,8 +18,12 @@ if(FLASH_MLA_SRC_DIR)
 else()
   FetchContent_Declare(
         flashmla
-        GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
-        GIT_TAG 0397728d511c4e3d94ea3a01d8dda8654525a611
+        # PR #17 (rope dim / qk_rope=0) head lives on the JaredforReal fork's
+        # rope_dim branch; it's unreachable from a plain clone of
+        # vllm-project/FlashMLA (only via refs/pull/*), so point at the fork.
+        # https://github.com/vllm-project/FlashMLA/pull/17
+        GIT_REPOSITORY https://github.com/JaredforReal/FlashMLA.git
+        GIT_TAG 8447acbcb558db892bf7c1197d225be1c95b168c
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""

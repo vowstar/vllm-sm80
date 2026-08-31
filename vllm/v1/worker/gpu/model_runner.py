@@ -677,6 +677,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
         )
 
     @torch.inference_mode()
@@ -996,7 +997,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+                # vllm#46994 relays MTP
+                # proposals from the last PP rank; install them before the next
+                # combine_sampled_and_draft_tokens call on non-last ranks.
+                draft_tokens = outputs.pop("draft_tokens", None)
+                idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
+                if draft_tokens is not None:
+                    valid = idx_mapping >= 0
+                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
+                        valid
+                    ]
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -1938,6 +1949,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.pp_handler is not None:
+                # match PPHandler.receive's
+                # third collective and relay proposals to all earlier stages.
+                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
