@@ -3492,6 +3492,67 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 12]
 
 
+def test_hybrid_swa_retention_mtp_pins_deepest_reachable_boundary():
+    """Sparse SWA retention must keep the boundary below an incomplete EAGLE
+    proof block, not fall back to the previous retention interval."""
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mtp"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    # max_cache_hit_length is 97. The nominal 96-token boundary has only one
+    # token after it, less than the 8-token EAGLE proof block. The deepest
+    # reachable 32-token-aligned boundary is therefore 64.
+    token_ids = list(range(98))
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req0,
+        len(token_ids),
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 8 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 8]
+
+
 def test_block_lookup_cache_single_block_per_key():
     cache = BlockHashToBlockMap()
     key0 = BlockHashWithGroupId(b"hash0")

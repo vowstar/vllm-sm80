@@ -438,8 +438,18 @@ class SingleTypeKVCacheManager(ABC):
     def _reachable_boundaries(self, request: Request) -> list[int]:
         """Token boundaries whose reachable tail must be retained under
         sparse retention: the replay boundary (``num_prompt - 1``, capped by
-        ``get_computed_blocks``) and any detected shared-prefix junction."""
+        ``get_computed_blocks``), the deepest EAGLE/MTP-reachable boundary,
+        and any detected shared-prefix junction."""
         reachable_boundaries = [request.num_prompt_tokens - 1]
+        # EAGLE/MTP lookup needs one extra proof block and then drops it. If
+        # the prompt ends before that proof block is complete, the nominal
+        # replay boundary is unreachable. Keep the deepest boundary below it
+        # so sparse SWA and Mamba retention do not fall back to the previous
+        # interval checkpoint.
+        if self.eagle_reach_margin > 0:
+            eagle_reach = request.num_prompt_tokens - 1 - self.eagle_reach_margin
+            if eagle_reach >= 0:
+                reachable_boundaries.append(eagle_reach)
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
         return reachable_boundaries
@@ -1498,20 +1508,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
-
-    def _reachable_boundaries(self, request: Request) -> list[int]:
-        boundaries = super()._reachable_boundaries(request)
-        # Under EAGLE/MTP the attention lookup drops its last matched block
-        # (`eagle_reach_margin` tokens), so the deepest state a replay can
-        # actually use lies that far below the replay boundary. Without it
-        # sparse retention keeps a state one block beyond any speculative
-        # lookup's reach and an identical prompt only hits once a junction
-        # forms (#53479).
-        if self.eagle_reach_margin > 0:
-            eagle_reach = request.num_prompt_tokens - 1 - self.eagle_reach_margin
-            if eagle_reach >= 0:
-                boundaries.append(eagle_reach)
-        return boundaries
 
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
