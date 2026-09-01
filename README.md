@@ -10,7 +10,7 @@ driver 610.43.02. Other sm_80 GPUs such as A100 are not tested.
 
 | Model | State | Tested layout |
 | --- | --- | --- |
-| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 cards, PP4, 1M context, vision, DSpark x3, fp8 KV |
+| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 or 5 cards, PP4 or PP5, 1M context, vision, DSpark x3, fp8 KV |
 | Qwen3.8-Flash-Next-FP8 | Serving, measured | 4 cards, PP4, 1M YaRN context, PLE CPU offload |
 | GLM-5.3-Flash | Serving, measured | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
 
@@ -22,7 +22,7 @@ this branch. It was validated at 64K context without speculative decoding.
 | Requirement | Value |
 | --- | --- |
 | GPU | sm_80. Tested only on CMP 170HX 64 GB, which has no peer to peer and a 64 MB BAR1. |
-| Cards | 4 for DeepSeek or Qwen, 5 for GLM. Tensor parallelism does not work on these cards, so the count is a pipeline depth. |
+| Cards | 4 for Qwen, 5 for GLM, 4 or 5 for DeepSeek. Tensor parallelism does not work on these cards, so the count is a pipeline depth. |
 | VRAM | 64 GB per card. The tightest rank runs within about 1.6 GiB of the limit. |
 | Host RAM | DeepSeek costs about 11 GB once serving, but weight load peaks far higher, so leave 30 GB free. Qwen needs about 70 GB, because its PLE table is 51 GB and lives in host memory. |
 | Disk | 156 to 170 GiB per checkpoint. |
@@ -133,19 +133,19 @@ recurrent state instead of a growing cache, and because its launcher pins
 Short prompts, 256 output tokens each. Aggregate is total output tokens per
 second. Median is what one stream sees.
 
-| Streams | DeepSeek aggregate | DeepSeek median | Qwen aggregate | Qwen median |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 73.6 | 76.5 | 51.5 | 53.0 |
-| 4 | 191.6 | 63.6 | 87.3 | 46.8 |
-| 8 | 259.4 | 39.5 | 180.9 | 38.7 |
-| 16 | 326.9 | 22.6 | 219.8 | 38.3 |
-| 32 | 476.5 | 19.9 | 315.3 | 43.0 |
+| Streams | DeepSeek aggregate | DeepSeek median | Qwen aggregate | Qwen median | GLM aggregate | GLM median |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 73.6 | 76.5 | 51.5 | 53.0 | 73.9 | 77.6 |
+| 4 | 191.6 | 63.6 | 87.3 | 46.8 | 136.5 | 45.2 |
+| 8 | 259.4 | 39.5 | 180.9 | 38.7 | 282.4 | 42.5 |
+| 16 | 326.9 | 22.6 | 219.8 | 38.3 | 286.3 | 21.7 |
+| 32 | 476.5 | 19.9 | 315.3 | 43.0 | 355.1 | 13.0 |
 
-Both scale to 32 streams. DeepSeek reaches about 6.5 times its single stream
-rate and Qwen about 6 times. Qwen keeps a higher per stream rate under load
-because its launcher caps `max-num-seqs` at 8, so the rest queue instead of
-sharing every step. GLM measured about 382 tok/s aggregate on ten concurrent
-200 K prefixes, which is a different and much heavier shape.
+All three scale to 32 streams. DeepSeek reaches about 6.5 times its single
+stream rate, Qwen about 6 times, and GLM about 4.8 times. Qwen keeps a higher
+per stream rate under load because its launcher caps `max-num-seqs` at 8, so
+the rest queue instead of sharing every step. GLM's per stream rate falls
+fastest because every stream carries a KDA recurrent state and MTP x3 drafts.
 
 An earlier build killed the Qwen engine at 32 streams. The PLE offload request
 queue held one entry and the producer used `put_nowait`, which assumes each
@@ -154,23 +154,6 @@ engine batch queue and breaks that assumption, so the queue filled, the rank 0
 worker raised `queue.Full`, and the engine died five minutes later on an RPC
 timeout. The producer now waits for the staging thread. The 32 stream row
 above is that same workload on the fixed build.
-
-### Prefix cache reuse
-
-An immediate replay of a 10,527 token DeepSeek prompt:
-
-| Build | Reused tokens | Fraction |
-| ---: | ---: | ---: |
-| Before the EAGLE boundary fix | 8,192 | 77.8 percent |
-| After | 10,240 | 97.3 percent |
-
-A prompt that ends less than one EAGLE proof block past a 256 token boundary
-used to fall back to the previous 4,096 token checkpoint. The fix keeps the
-deepest reachable boundary for sparse sliding window groups, which previously
-only Mamba groups received.
-
-GLM replays a 1 M prompt at 99.2 percent, taking time to first token from
-207 s to 10.5 s.
 
 ## DeepSeek V4 Flash and Vision
 
@@ -319,7 +302,8 @@ docker run -d --name vllm --runtime=nvidia \
   --reasoning-parser glm47 \
   --enable-auto-tool-choice --tool-call-parser glm47 \
   --moe-backend marlin \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --prefix-match-unit 256
 ```
 
 Qwen3.8-Flash-Next on four cards:
@@ -355,7 +339,7 @@ Settings that are easy to get wrong:
 | Setting | Reason |
 | --- | --- |
 | `--block-size 256` | The DeepSeek and GLM indexer needs a multiple of 128, and the sparse MLA backend needs a multiple of 64. |
-| `VLLM_PP_LAYER_PARTITION` | The last rank also carries `lm_head` and the draft layer, so give it fewer decoder layers. DeepSeek Vision is validated only at `12,12,12,7`. |
+| `VLLM_PP_LAYER_PARTITION` | The last rank also carries `lm_head` and the draft layer, so give it fewer decoder layers. DeepSeek Vision is validated at `12,12,12,7` (PP4) and `9,9,9,9,7` (PP5). |
 | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | Align it to the model's hybrid block size. DeepSeek uses 4096. GLM uses 143360 with fp8 KV and 73728 with bfloat16 KV. |
 | `VLLM_MARLIN_REPACK_HOLDOFF` | Avoids a load time MMU fault seen on CMP 170HX with driver 610.43.02. Set it to 0 elsewhere. |
 | `--kv-cache-memory` | GLM only. Stops Mamba state copies from evicting every hashed checkpoint when the default pool is too small. |
