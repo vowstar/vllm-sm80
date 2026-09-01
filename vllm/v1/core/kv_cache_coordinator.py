@@ -650,10 +650,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         self.enable_partial_hash_hits = has_partial_mamba_group
         if self.enable_partial_hash_hits:
+            # Only groups that participate in prefix caching can block a
+            # fine-grained lookup. A scratch group such as the GLM-5.3-Flash
+            # kpool tail is never looked up, so its block size is irrelevant
+            # here, the same exclusion the divisibility check above applies.
             unsupported_partial_hit_managers = {
                 type(manager).__name__
-                for manager in self.single_type_managers
-                if not manager.supports_fine_grained_hash_lookup
+                for manager, group in zip(
+                    self.single_type_managers, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.participates_in_prefix_caching
+                and not manager.supports_fine_grained_hash_lookup
                 and manager.block_size != hash_block_size
             }
             if unsupported_partial_hit_managers:
