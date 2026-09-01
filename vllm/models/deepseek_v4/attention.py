@@ -599,7 +599,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return torch.mm(
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                    out_dtype=torch.bfloat16,
                 )
 
             aux_fns[1] = indexer_weights_proj
