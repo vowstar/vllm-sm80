@@ -182,6 +182,21 @@ class InputProcessor:
         sampling_params.stop_token_ids = []
         sampling_params._all_stop_token_ids = set()
 
+    def _validate_prompt_logprobs(
+        self,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None,
+    ) -> None:
+        if (
+            sampling_params.prompt_logprobs is not None
+            and prompt_token_ids
+            and max(prompt_token_ids) >= self.model_config.get_vocab_size()
+        ):
+            raise VLLMValidationError(
+                "prompt_logprobs is not supported for prompts containing "
+                "out-of-vocabulary multimodal placeholder tokens."
+            )
+
     def _validate_lora(self, lora_request: LoRARequest | None) -> None:
         if lora_request is None:
             return
@@ -361,6 +376,8 @@ class InputProcessor:
                 )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
 
+            self._validate_prompt_logprobs(sampling_params, prompt_token_ids)
+
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,
                 self.renderer.get_eos_token_id(),
@@ -530,6 +547,13 @@ class InputProcessor:
             # Here we take the max of the two to determine if a token id is
             # truly out-of-vocabulary.
             model_vocab_size = model_config.get_vocab_size()
+            hf_config = getattr(model_config, "hf_config", None)
+            has_oov_image_tokens = (
+                int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0
+            )
+            model_max_token_id = (
+                model_vocab_size + 4 if has_oov_image_tokens else model_vocab_size - 1
+            )
             # A negative id is out of vocabulary just like an over-large one,
             # but is not caught by the upper-bound check below. Reject it here
             # so it is not used as an embedding index downstream. This
@@ -539,7 +563,7 @@ class InputProcessor:
                 raise VLLMValidationError(
                     f"Token id {min_input_id} is out of vocabulary"
                 )
-            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
+            if max_input_id > max(tokenizer.max_token_id, model_max_token_id):
                 raise VLLMValidationError(
                     f"Token id {max_input_id} is out of vocabulary"
                 )
