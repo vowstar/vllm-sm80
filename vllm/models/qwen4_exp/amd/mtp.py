@@ -337,7 +337,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
+            ignore_unexpected_prefixes=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -438,7 +438,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
+            ignore_unexpected_prefixes=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(remap_weight_names())

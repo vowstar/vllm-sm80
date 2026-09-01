@@ -562,18 +562,17 @@ class Qwen4ExpModel(nn.Module):
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
-        # column for them.
-        skip_substrs = [
-            "hashstats_",
-            "token_lookup",
-            "hyper_connection_mixer.block_inject_weight",
-        ]
+        # The final mixer is built with use_combine=False, so it drops the
+        # checkpoint's block_inject_weight column; on non-last PP ranks the
+        # whole hyper_connection_mixer module is absent. Non-persistent PLE
+        # state (hashstats_*, token_lookup) is already excluded by
+        # Qwen4ExpPLELayer.load_weights, so it needs no ignore entry here.
+        ignore_unexpected_prefixes = ["hyper_connection_mixer.block_inject_weight"]
         if self.hyper_connection_mixer is None:
-            skip_substrs.append("hyper_connection_mixer")
+            ignore_unexpected_prefixes.append("hyper_connection_mixer")
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=skip_substrs,
+            ignore_unexpected_prefixes=ignore_unexpected_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(
@@ -803,7 +802,7 @@ class Qwen4ExpForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["mtp."],
+            ignore_unexpected_prefixes=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -994,8 +993,9 @@ class Qwen4ExpForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["visual."] if self.language_model_only else None,
-            skip_substrs=["mtp."],
+            ignore_unexpected_prefixes=(
+                ["visual.", "mtp."] if self.language_model_only else ["mtp."]
+            ),
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

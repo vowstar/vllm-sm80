@@ -562,16 +562,13 @@ class Qwen4ExpModel(nn.Module):
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
-        # column for them.
-        skip_substrs = [
-            "hashstats_",
-            "token_lookup",
-            "hyper_connection_mixer.block_inject_weight",
-        ]
+        # Non-persistent PLE state (hashstats_*, token_lookup) is already
+        # excluded by Qwen4ExpPLELayer.load_weights. The final mixer drops the
+        # checkpoint's block_inject_weight column.
+        ignore_unexpected_prefixes = ["hyper_connection_mixer.block_inject_weight"]
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=skip_substrs,
+            ignore_unexpected_prefixes=ignore_unexpected_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(
@@ -801,7 +798,7 @@ class Qwen4ExpForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=["mtp."],
+            ignore_unexpected_prefixes=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -992,8 +989,9 @@ class Qwen4ExpForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["visual."] if self.language_model_only else None,
-            skip_substrs=["mtp."],
+            ignore_unexpected_prefixes=(
+                ["visual.", "mtp."] if self.language_model_only else ["mtp."]
+            ),
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
