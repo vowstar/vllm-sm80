@@ -130,18 +130,21 @@ recurrent state instead of a growing cache, and because its launcher pins
 
 ### Throughput against concurrency
 
-Not published. The three models run different topologies (DeepSeek PP4 and PP5,
-Qwen PP4, GLM PP5) and different true-concurrency caps (`--max-num-seqs`:
-DeepSeek 128, GLM 32, Qwen 8), so one "streams" count does not mean the same
-thing per model and a table would compare unlike setups. A consistent
-measurement is pending.
+The three models run different topologies (DeepSeek PP4 and PP5, Qwen PP4,
+GLM PP5) and different true-concurrency caps (`--max-num-seqs`): DeepSeek 128,
+GLM 32, Qwen 32. Qwen's production launcher had pinned 8 to keep single-stream
+latency high, but that is a choice, not a limit: raised to 32, Qwen PP4 runs
+32 concurrent streams at 804.8 tok/s aggregate (26.5 tok/s per-stream median)
+on the 440 GiB-RAM server with no crash. A shared throughput table is not
+published because the three models' different topologies and caps make one
+"streams" count mean different things per model.
 
 An earlier build killed the Qwen engine at 32 streams. The PLE offload request
 queue held one entry and the producer used `put_nowait`, which assumes each
 forward is consumed before the next launch. Pipeline parallelism runs the
 engine batch queue and breaks that assumption, so the queue filled, the rank 0
 worker raised `queue.Full`, and the engine died five minutes later on an RPC
-timeout. The producer now waits for the staging thread.
+timeout. The producer now blocks on a 60 s bound, and 32 streams is stable.
 
 ## DeepSeek V4 Flash and Vision
 
