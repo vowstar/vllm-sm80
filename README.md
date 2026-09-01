@@ -130,10 +130,13 @@ recurrent state instead of a growing cache, and because its launcher pins
 
 ### Throughput against concurrency
 
-Short prompts, 256 output tokens each. Aggregate is total output tokens per
-second. Median is what one stream sees.
+Short prompts, 256 output tokens each. "Submitted" is the number of requests
+sent at once; how many actually run in parallel is capped by each model's
+`--max-num-seqs` (DeepSeek 128, GLM 32, Qwen 8), and requests above the cap
+queue. Aggregate is total output tokens per second. Median is what one running
+stream sees.
 
-| Streams | DeepSeek aggregate | DeepSeek median | Qwen aggregate | Qwen median | GLM aggregate | GLM median |
+| Submitted | DeepSeek aggregate | DeepSeek median | Qwen aggregate | Qwen median | GLM aggregate | GLM median |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 73.6 | 76.5 | 51.5 | 53.0 | 73.9 | 77.6 |
 | 4 | 191.6 | 63.6 | 87.3 | 46.8 | 136.5 | 45.2 |
@@ -141,11 +144,13 @@ second. Median is what one stream sees.
 | 16 | 326.9 | 22.6 | 219.8 | 38.3 | 286.3 | 21.7 |
 | 32 | 476.5 | 19.9 | 315.3 | 43.0 | 355.1 | 13.0 |
 
-All three scale to 32 streams. DeepSeek reaches about 6.5 times its single
-stream rate, Qwen about 6 times, and GLM about 4.8 times. Qwen keeps a higher
-per stream rate under load because its launcher caps `max-num-seqs` at 8, so
-the rest queue instead of sharing every step. GLM's per stream rate falls
-fastest because every stream carries a KDA recurrent state and MTP x3 drafts.
+Aggregate scales with true concurrency, not the submitted count. DeepSeek and
+GLM run every submitted stream (their caps are 128 and 32), so at 32 they
+reach about 6.5x and 4.8x their single-stream rate. Qwen caps true concurrency
+at 8, so its "32" row is 8 running plus 24 queued: aggregate stops growing
+after 8 and its per-stream rate stays near 43 tok/s. GLM's per-stream rate
+falls fastest because each stream carries a KDA recurrent state and MTP x3
+drafts.
 
 An earlier build killed the Qwen engine at 32 streams. The PLE offload request
 queue held one entry and the producer used `put_nowait`, which assumes each
