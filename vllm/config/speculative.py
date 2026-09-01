@@ -494,6 +494,10 @@ class SpeculativeConfig:
     the ctx bucket for 5-item schedules."""
 
     # params generated in the post-init stage
+    target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
+    """The configuration of the target model."""
+    target_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
+    """The parallel configuration for the target model."""
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
