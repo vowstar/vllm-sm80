@@ -6,7 +6,7 @@ Each QSA layer keeps a fixed circular buffer of raw index keys (the
 compressor state) and one compressed key. MRoPE models pack exact three-axis
 positions beside the raw keys; text models derive group positions from
 logical positions. The compressor state uses one block per request, while
-the compressed owner uses ``MLAAttentionSpec.compress_ratio`` so its block
+the compressed owner uses ``MLAAttentionSpec.tokens_per_state`` so its block
 table follows the main KV-cache lifecycle. Their physical tensor storage is
 shared by the generic cache-layout planner.
 """
@@ -805,7 +805,7 @@ class QSACompressedKeyCache(_QSAStateCache):
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
         )
 
 
