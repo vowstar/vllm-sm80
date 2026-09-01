@@ -28,6 +28,10 @@ from vllm.v1.ple_offload.protocol import (
 
 logger = init_logger(__name__)
 
+# Upper bound on how long a forward waits for the staging thread to drain the
+# previous request before the launch is treated as a stuck offload worker.
+PLE_LAUNCH_QUEUE_TIMEOUT_S = 60.0
+
 
 def _cuda_check(result: Any, operation: str) -> Any:
     """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
@@ -93,7 +97,10 @@ class PleOffloadConnector:
 
         self._pinned_input_buffers: list[torch.Tensor] = []
         # PLE rejects DBO, and each forward consumes its output before the
-        # next launch, so one pending request is sufficient.
+        # next launch, so one pending request is sufficient. Pipeline
+        # parallelism runs the engine batch queue, which can start the next
+        # forward before the staging thread has drained the previous request,
+        # so the producer waits instead of failing.
         self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
             maxsize=1
         )
@@ -386,7 +393,14 @@ class PleOffloadConnector:
             num_tokens=num_tokens,
             num_reqs=num_reqs,
         )
-        self._request_queue.put_nowait(request)
+        try:
+            self._request_queue.put(request, timeout=PLE_LAUNCH_QUEUE_TIMEOUT_S)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "PLE offload staging did not drain within "
+                f"{PLE_LAUNCH_QUEUE_TIMEOUT_S} s. The staging thread is stuck "
+                "or the host cannot keep up with the request rate."
+            ) from exc
 
     def prepare_forward(
         self,
