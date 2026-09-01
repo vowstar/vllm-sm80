@@ -14,7 +14,7 @@ tested.
 | --- | --- |
 | GLM-5.3-Flash | Production tested with NVFP4, PP5, MTP x3, 1M context, vision, fp8 KV cache, and prefix caching. |
 | DeepSeek-V4-Flash-Vision-Exp | Source and immutable image candidate are complete. Full hardware acceptance is pending. |
-| Qwen3.8-Flash-Next-FP8 | Tested with PP5. Plain decoding starts, but performance and stability are not production ready. MTP with PP5 fails. |
+| Qwen3.8-Flash-Next-FP8 | A historical Docker image was tested with PP5. Performance and stability were not production ready. MTP with PP5 failed. |
 
 The Qwen result is a tested limitation. It is not a support claim.
 
@@ -145,8 +145,19 @@ container restarts.
 
 ## Qwen3.8-Flash-Next
 
-Qwen3.8-Flash-Next-FP8 was tested on five CMP 170HX GPUs. The tested image
-used vLLM main, PR #53899, and four local compatibility patches.
+Qwen3.8-Flash-Next-FP8 was tested on five CMP 170HX GPUs. This repository
+contains a rebased and adapted snapshot of the first two
+[PR #53899](https://github.com/vllm-project/vllm/pull/53899) commits from the
+`f561eca6c` period. A historical Docker image added four uncommitted
+compatibility patches and produced the measurements below.
+
+The current Git tree contains only the Ampere GDN declaration-guard fix. That
+fix later entered upstream through
+[PR #52743](https://github.com/vllm-project/vllm/pull/52743). It does not
+contain the three PP5 PLE and model-state patches used by the historical image.
+The PP5 result is therefore not reproducible from this tree alone. This
+repository does not claim
+Qwen3.8-Flash-Next PP5, MTP, vision, long-context, or concurrency support.
 
 | Test | Result |
 | --- | --- |
