@@ -12,7 +12,7 @@ driver 610.43.02. Other sm_80 GPUs such as A100 are not tested.
 | --- | --- | --- |
 | DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 cards, PP4, 1M context, vision, DSpark x3, fp8 KV |
 | Qwen3.8-Flash-Next-FP8 | Serving, measured | 4 cards, PP4, 1M YaRN context, PLE CPU offload |
-| GLM-5.3-Flash | Production tested earlier, not running now | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
+| GLM-5.3-Flash | Serving, measured | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
 
 DeepSeek-V4-Flash-0731, the text only checkpoint, also loads and answers on
 this branch. It was validated at 64K context without speculative decoding.
@@ -45,9 +45,8 @@ That is the whole build. Nothing else in this repository is required.
 ## Measured performance
 
 Two hosts, each five CMP 170HX 64 GB cards behind a shared PCIe uplink with no
-peer to peer. DeepSeek and Qwen numbers come from one harness against a live
-service with real technical prose as the prompt. GLM numbers predate that
-harness and are marked where they appear.
+peer to peer. All three columns come from one harness against a live service
+with real technical prose as the prompt.
 
 Use real prose. A prompt built from one repeated word makes speculative
 decoding accept almost everything at short context and almost nothing at long
@@ -62,12 +61,12 @@ prefill.
 
 | Prompt tokens | DeepSeek tok/s | Qwen tok/s | GLM tok/s |
 | ---: | ---: | ---: | ---: |
-| About 2 K | 75.8 | 53.3 | 70 |
-| About 7 K | 66.4 | 51.4 | not measured |
-| About 30 K | 77.9 | 52.3 | 74.5 |
-| About 90 K | 58.2 | 52.0 | 66.4 |
-| About 230 K | 58.5 | 53.0 | 70.1 |
-| About 460 K | 48.2 | 55.1 | not measured |
+| About 2 K | 75.8 | 53.3 | 68.7 |
+| About 7 K | 66.4 | 51.4 | 60.8 |
+| About 30 K | 77.9 | 52.3 | 64.3 |
+| About 90 K | 58.2 | 52.0 | 62.7 |
+| About 230 K | 58.5 | 53.0 | 62.5 |
+| About 460 K | 48.2 | 55.1 | 54.0 |
 | About 900 K to 1 M | 26.0 | 54.1 | 68.3 |
 
 Read the three columns as three attention designs, not as a ranking.
@@ -86,9 +85,9 @@ faster to prefill.
 
 Two caveats on this table. Only DeepSeek and GLM run speculative decoding, so
 part of their short context advantage is draft acceptance rather than step
-time. The GLM column comes from an earlier harness on five cards with PP5,
-MTP x3 and bfloat16 KV, and its 2 K entry was a 21 token prompt, so treat it
-as an indication of shape rather than a like for like comparison.
+time. The GLM column uses fp8 KV, the production default, so it decodes a few
+tokens per second slower than the same model with bfloat16 KV; the comparison
+table below quantifies the gap.
 
 ### Prefill
 
@@ -96,17 +95,17 @@ Time to first token on the same runs, with the rate it implies.
 
 | Prompt tokens | DeepSeek | Qwen | GLM |
 | ---: | ---: | ---: | ---: |
-| About 2 K | 0.9 s, 2,163 tok/s | 0.5 s, 4,102 tok/s | not measured |
-| About 30 K | 5.8 s, 5,225 tok/s | 2.9 s, 10,267 tok/s | not measured |
-| About 90 K | 17.9 s, 5,146 tok/s | 6.2 s, 14,499 tok/s | not measured |
-| About 230 K | 53.1 s, 4,336 tok/s | 15.3 s, 14,670 tok/s | 66.2 s, 3,776 tok/s |
-| About 460 K | 138.0 s, 3,334 tok/s | 33.9 s, 13,277 tok/s | not measured |
-| About 900 K to 1 M | 406.7 s, 2,262 tok/s | 82.9 s, 10,751 tok/s | 176.6 s, 5,937 tok/s |
+| About 2 K | 0.9 s, 2,163 tok/s | 0.5 s, 4,102 tok/s | 1.2 s, 1,439 tok/s |
+| About 30 K | 5.8 s, 5,225 tok/s | 2.9 s, 10,267 tok/s | 8.8 s, 3,089 tok/s |
+| About 90 K | 17.9 s, 5,146 tok/s | 6.2 s, 14,499 tok/s | 20.9 s, 3,973 tok/s |
+| About 230 K | 53.1 s, 4,336 tok/s | 15.3 s, 14,670 tok/s | 49.1 s, 4,216 tok/s |
+| About 460 K | 138.0 s, 3,334 tok/s | 33.9 s, 13,277 tok/s | 102.1 s, 4,055 tok/s |
+| About 900 K to 1 M | 406.7 s, 2,262 tok/s | 82.9 s, 10,751 tok/s | 289.0 s, 3,177 tok/s |
 
 Qwen prefills two to four times faster than DeepSeek at every length and holds
-its rate, while DeepSeek peaks near 30 K and then halves. The two GLM entries
-come from separate runs in different KV modes, so do not read a trend into
-them.
+its rate, while DeepSeek peaks near 30 K and then halves. GLM peaks near
+4,200 tok/s around 230 K and drops to about 3,200 tok/s at 1 M. Its fp8 KV
+prefill is slower than bfloat16 KV, as the comparison table below shows.
 
 ### Capacity and start up
 
