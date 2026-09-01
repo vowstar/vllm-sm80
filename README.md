@@ -1,71 +1,306 @@
 # vllm-sm80
 
-This vLLM fork adds and validates model paths for NVIDIA sm_80 GPUs. The
-repository keeps the GLM, DeepSeek Vision, and Qwen experimental work on one
-`main` branch.
+This vLLM fork runs three large models on NVIDIA sm_80 GPUs that upstream vLLM
+does not support there. All three share one `main` branch and one image.
 
-Development and testing use five CMP 170HX 64 GB GPUs with pipeline
-parallelism and driver 610.43.02. Other sm_80 GPUs such as A100 are not yet
-tested.
+Development and testing use CMP 170HX 64 GB cards with pipeline parallelism and
+driver 610.43.02. Other sm_80 GPUs such as A100 are not tested.
 
 ## Status
 
-| Model | Result |
+| Model | State | Tested layout |
+| --- | --- | --- |
+| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 cards, PP4, 1M context, vision, DSpark x3, fp8 KV |
+| Qwen3.8-Flash-Next-FP8 | Serving, measured | 4 cards, PP4, 1M YaRN context, PLE CPU offload |
+| GLM-5.3-Flash | Production tested earlier, not running now | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
+
+DeepSeek-V4-Flash-0731, the text only checkpoint, also loads and answers on
+this branch. It was validated at 64K context without speculative decoding.
+
+## Hardware
+
+| Requirement | Value |
 | --- | --- |
-| GLM-5.3-Flash | Production tested with NVFP4, PP5, MTP x3, 1M context, vision, fp8 KV cache, and prefix caching. |
-| DeepSeek-V4-Flash-Vision-Exp | Source and immutable image candidate are complete. Full hardware acceptance is pending. |
-| Qwen3.8-Flash-Next-FP8 | A historical Docker image was tested with PP5. Performance and stability were not production ready. MTP with PP5 failed. |
+| GPU | sm_80. Tested only on CMP 170HX 64 GB, which has no peer to peer and a 64 MB BAR1. |
+| Cards | 4 for DeepSeek or Qwen, 5 for GLM. Tensor parallelism does not work on these cards, so the count is a pipeline depth. |
+| VRAM | 64 GB per card. The tightest rank runs within about 1.6 GiB of the limit. |
+| Host RAM | DeepSeek costs about 11 GB once serving, but weight load peaks far higher, so leave 30 GB free. Qwen needs about 70 GB, because its PLE table is 51 GB and lives in host memory. |
+| Disk | 156 to 170 GiB per checkpoint. |
+| Driver | 610.43.02. Other drivers are untested and the Marlin holdoff below exists because of this one. |
 
-The Qwen result is a tested limitation. It is not a support claim.
+## Building the image
 
-## GLM-5.3-Flash
+Build with the upstream Dockerfile and restrict the architecture list, which
+cuts compile time by a large factor:
 
-### Validated features
+```bash
+docker build -f docker/Dockerfile --target vllm-openai \
+  --build-arg torch_cuda_arch_list=8.0 \
+  --build-arg max_jobs=8 \
+  -t vllm-sm80:$(git rev-parse --short HEAD) .
+```
+
+That is the whole build. Nothing else in this repository is required.
+
+## Measured performance
+
+Two hosts, each five CMP 170HX 64 GB cards behind a shared PCIe uplink with no
+peer to peer. DeepSeek and Qwen numbers come from one harness against a live
+service with real technical prose as the prompt. GLM numbers predate that
+harness and are marked where they appear.
+
+Use real prose. A prompt built from one repeated word makes speculative
+decoding accept almost everything at short context and almost nothing at long
+context, which turns a flat curve into a cliff. The same DeepSeek service
+measured 101 tok/s at 2 K and 29 tok/s at 1 M on a repeated word prompt, and
+76 tok/s and 26 tok/s on prose. Only the prose numbers mean anything.
+
+### Decode speed against context length
+
+One stream, cold prompt, no prefix cache hit. Time to first token is the full
+prefill.
+
+| Prompt tokens | DeepSeek tok/s | Qwen tok/s | GLM tok/s |
+| ---: | ---: | ---: | ---: |
+| About 2 K | 75.8 | 53.3 | 70 |
+| About 7 K | 66.4 | 51.4 | not measured |
+| About 30 K | 77.9 | 52.3 | 74.5 |
+| About 90 K | 58.2 | 52.0 | 66.4 |
+| About 230 K | 58.5 | 53.0 | 70.1 |
+| About 460 K | 48.2 | 55.1 | not measured |
+| About 900 K to 1 M | 26.0 | 54.1 | 68.3 |
+
+Read the three columns as three attention designs, not as a ranking.
+
+Qwen holds one decode rate at every length because its GDN linear attention
+keeps a constant size recurrent state. GLM is also close to flat because only
+11 of its 45 layers are sparse MLA and the other 34 are KDA linear attention.
+DeepSeek is the only one that falls away, because its sparse indexer scores
+every position in the cache on every step and its DSpark acceptance drops with
+context.
+
+The crossovers matter more than the peaks. DeepSeek leads GLM up to about
+30 K and trails it after that. DeepSeek leads Qwen up to somewhere between
+230 K and 460 K, and past that Qwen is both faster to decode and several times
+faster to prefill.
+
+Two caveats on this table. Only DeepSeek and GLM run speculative decoding, so
+part of their short context advantage is draft acceptance rather than step
+time. The GLM column comes from an earlier harness on five cards with PP5,
+MTP x3 and bfloat16 KV, and its 2 K entry was a 21 token prompt, so treat it
+as an indication of shape rather than a like for like comparison.
+
+### Prefill
+
+Time to first token on the same runs, with the rate it implies.
+
+| Prompt tokens | DeepSeek | Qwen | GLM |
+| ---: | ---: | ---: | ---: |
+| About 2 K | 0.9 s, 2,163 tok/s | 0.5 s, 4,102 tok/s | not measured |
+| About 30 K | 5.8 s, 5,225 tok/s | 2.9 s, 10,267 tok/s | not measured |
+| About 90 K | 17.9 s, 5,146 tok/s | 6.2 s, 14,499 tok/s | not measured |
+| About 230 K | 53.1 s, 4,336 tok/s | 15.3 s, 14,670 tok/s | 66.2 s, 3,776 tok/s |
+| About 460 K | 138.0 s, 3,334 tok/s | 33.9 s, 13,277 tok/s | not measured |
+| About 900 K to 1 M | 406.7 s, 2,262 tok/s | 82.9 s, 10,751 tok/s | 176.6 s, 5,937 tok/s |
+
+Qwen prefills two to four times faster than DeepSeek at every length and holds
+its rate, while DeepSeek peaks near 30 K and then halves. The two GLM entries
+come from separate runs in different KV modes, so do not read a trend into
+them.
+
+### Capacity and start up
+
+Measured on the running services. The KV pool is what the engine reports after
+it sizes the cache.
+
+| | DeepSeek Vision | Qwen | GLM |
+| --- | ---: | ---: | ---: |
+| Checkpoint on disk | 156 GiB | 173 GiB | 183 GiB |
+| Parameters | 305 B, about 16 B active | 180 B, 51 B of it the PLE table, about 10 B active | 320 B, 18 B active |
+| Cards, pipeline stages | 4, PP4 | 4, PP4 | 5, PP5 |
+| Weights per card | 41.2 GiB | About 55 GiB | About 49 to 64 GiB |
+| KV pool | 2,655,371 tokens | 2,885,563 tokens | 6,670,108 tokens |
+| Concurrency at 1 M context | 2.53x | 2.89x | 6.36x |
+| Cold start to serving | 4 minutes from NVMe | 35 minutes from spinning disks | 4 minutes from NVMe |
+
+The Qwen cold start is dominated by reading 173 GiB of weights, 51 GB of it
+the PLE table, off spinning disks. The same model on NVMe would not take that long.
+GLM holds a much larger KV pool because its 34 KDA layers store a fixed size
+recurrent state instead of a growing cache, and because its launcher pins
+`--kv-cache-memory` at 12.5 GiB per rank.
+
+### Throughput against concurrency
+
+Short prompts, 256 output tokens each. Aggregate is total output tokens per
+second. Median is what one stream sees.
+
+| Streams | DeepSeek aggregate | DeepSeek median | Qwen aggregate | Qwen median |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 73.6 | 76.5 | 51.5 | 53.0 |
+| 4 | 191.6 | 63.6 | 87.3 | 46.8 |
+| 8 | 259.4 | 39.5 | 180.9 | 38.7 |
+| 16 | 326.9 | 22.6 | 219.8 | 38.3 |
+| 32 | 476.5 | 19.9 | 315.3 | 43.0 |
+
+Both scale to 32 streams. DeepSeek reaches about 6.5 times its single stream
+rate and Qwen about 6 times. Qwen keeps a higher per stream rate under load
+because its launcher caps `max-num-seqs` at 8, so the rest queue instead of
+sharing every step. GLM measured about 382 tok/s aggregate on ten concurrent
+200 K prefixes, which is a different and much heavier shape.
+
+An earlier build killed the Qwen engine at 32 streams. The PLE offload request
+queue held one entry and the producer used `put_nowait`, which assumes each
+forward is consumed before the next launch. Pipeline parallelism runs the
+engine batch queue and breaks that assumption, so the queue filled, the rank 0
+worker raised `queue.Full`, and the engine died five minutes later on an RPC
+timeout. The producer now waits for the staging thread. The 32 stream row
+above is that same workload on the fixed build.
+
+### Prefix cache reuse
+
+An immediate replay of a 10,527 token DeepSeek prompt:
+
+| Build | Reused tokens | Fraction |
+| ---: | ---: | ---: |
+| Before the EAGLE boundary fix | 8,192 | 77.8 percent |
+| After | 10,240 | 97.3 percent |
+
+A prompt that ends less than one EAGLE proof block past a 256 token boundary
+used to fall back to the previous 4,096 token checkpoint. The fix keeps the
+deepest reachable boundary for sparse sliding window groups, which previously
+only Mamba groups received.
+
+GLM replays a 1 M prompt at 99.2 percent, taking time to first token from
+207 s to 10.5 s.
+
+## DeepSeek V4 Flash and Vision
+
+The Vision checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
 
 | Feature | State |
 | --- | --- |
-| NVFP4 W4A16 MoE | Works with Marlin. A Triton emulation backend remains available as a fallback. |
-| MTP x3 speculative decoding | Works |
-| Context length | 1,048,576 tokens works |
+| 1,048,576 token context | Works |
+| Image input | Works, checked against a generated test image |
+| DSpark speculative decoding under PP | Works |
+| Prefix caching | Works |
+| Tool calls and the `deepseek_v4` parser | Works, checked with a function call |
+| KV offload | Present, not exercised here |
+
+Main changes for this model:
+
+| Area | Change |
+| --- | --- |
+| Vision | Adds the vision tower, multimodal processor, registration, and weight loading. |
+| Image routing | Routes image tokens through the `bias_vl` MoE path. |
+| PrefixLM | Adds multimodal placeholders and image local PrefixLM attention. |
+| Ampere | Adds sparse sliding attention for image tokens on sm_80. |
+| Pipeline parallelism | Carries vision metadata across PP ranks and adds the DSpark PP path. |
+| Prefix caching | Keeps the deepest EAGLE reachable boundary for sparse sliding window groups. |
+| Metrics | Caps speculative acceptance at the number of drafts a grammar left valid. |
+
+## Qwen3.8-Flash-Next
+
+The checkpoint is `Qwen3.8-Flash-Next-FP8` with the `qwen4_exp` architecture.
+Upstream [PR #53899](https://github.com/vllm-project/vllm/pull/53899) validated
+tensor parallel and data parallel only, so the pipeline parallel path here is
+this fork's work.
+
+| Feature | State |
+| --- | --- |
+| PP4 serving | Works |
+| 1,000,000 token YaRN context | Works, from a native 262,144 |
+| PLE CPU offload under PP | Works |
+| 32 concurrent streams | Works after the staging queue fix |
+| Prefix caching | Works |
+| Vision tower | Loads and warms up, image accuracy not checked |
+| MTP | Not available under PP |
+
+The PLE table is a 51 GB FP8 ngram embedding of 16 heads over a 20 million
+entry vocabulary, which is 51 of the model's 180 billion parameters. It stays in host memory and costs about microseconds per
+token, so it is not the decode bottleneck. It does need roughly 63 GB of host
+RAM for the whole container, and its staging thread is what fails first under
+heavy concurrency.
+
+Main changes for this model:
+
+| Area | Change |
+| --- | --- |
+| PLE offload | Enables it on rank 0 under pipeline parallelism instead of rejecting PP. |
+| PLE offload | Waits for the staging queue instead of raising `queue.Full` and killing the engine. |
+| Model state | Disables ngram state on non first ranks rather than failing. |
+| Weight loading | Skips the final mixer weights on non last ranks. |
+| Marlin FP8 | Adds the repack holdoff that CMP 170HX needs. |
+
+## GLM-5.3-Flash
+
+| Feature | State |
+| --- | --- |
+| NVFP4 W4A16 MoE | Works with Marlin, with a Triton emulation fallback |
+| MTP x3 | Works |
+| 1,048,576 token context | Works |
 | FP8 latent KV cache | Works with e4m3fn storage |
 | Prefix caching | Works with the fixes in this fork |
 | Vision input | Works |
-| Tool calls and `glm47` parser | Work |
+| Tool calls and the `glm47` parser | Work |
 
-Measured on five CMP 170HX GPUs with PP5 partition `11,9,9,9,7`, MTP x3,
-and the Marlin backend:
-
-| Test | Result |
-| --- | --- |
-| Decode, one stream with a 200K prefix | About 100 tok/s |
-| Decode, 10 concurrent 200K prefixes | About 382 tok/s aggregate |
-| Cold prefill, one 200K prefix | About 32 s |
-
-FP8 KV cache and bfloat16 KV cache were also compared on the same system:
+FP8 KV against bfloat16 KV on the same system:
 
 | Test | FP8 KV | bfloat16 KV |
 | --- | --- | --- |
-| KV pool | 6.67M tokens | 3.79M tokens |
-| Decode, one stream with a 1M prefix | About 71 tok/s | About 77 tok/s |
-| Cold prefill, one 1M prefix | About 305 s | About 173 s |
-| Needle recall at 128K, 512K, and 1M | All pass | All pass |
+| KV pool | 6.67 M tokens | 3.79 M tokens |
+| Decode with a 1 M prefix | About 71 tok/s | About 77 tok/s |
+| Cold prefill at 1 M | About 305 s | About 173 s |
+| Needle recall at 128 K, 512 K, and 1 M | All pass | All pass |
 
-### Main GLM changes
+Main changes for this model:
 
 | Area | Change |
 | --- | --- |
 | Sparse MLA attention | Adds a Triton NoPE kernel for sm_80 and an indexer fallback. |
 | FP8 KV stores | Adds software e4m3fn encoding for sm_80. |
-| FP8 latent KV cache | Uses uint8 storage and in-kernel dequantization without sm_89 FP8 instructions. |
-| NVFP4 MoE | Adds the W4A16 path, Marlin repack holdoff, and a fused Triton emulation fallback. |
-| Prefix caching | Ports the relevant scheduler fixes and adds uncached-first allocation, one cached FIFO, transient headroom, and optional diagnostics. |
+| FP8 latent KV cache | Uses uint8 storage and in kernel dequantization without sm_89 FP8 instructions. |
+| NVFP4 MoE | Adds the W4A16 path, the Marlin repack holdoff, and a fused Triton emulation fallback. |
+| Prefix caching | Adds uncached first allocation, one cached FIFO, transient headroom, and diagnostics. |
 | Large KV pools | Fixes integer width in the sparse MLA path. |
-| Mamba postprocess | Uses a blocking device-to-host copy for the accepted token count. |
 
-### Example GLM launch
+## Launch examples
 
-Build an image from this checkout, then adapt the GPU list and layer partition
-to the target system.
+Build one image from this checkout and use it for all three models. Adapt the
+GPU list and the layer partition to the target system.
+
+DeepSeek-V4-Flash-Vision-Exp on four cards. This is the tested layout, and the
+partition and the two image limit are the values the service validates
+against:
+
+```bash
+docker run -d --name vllm --runtime=nvidia \
+  -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
+  -e VLLM_PP_LAYER_PARTITION=12,12,12,7 \
+  -e VLLM_MARLIN_FP8_DEQUANT_BF16=1 \
+  -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096 \
+  -e DSV4_LOGITS_ROW_CHUNK=64 \
+  -e HF_HUB_OFFLINE=1 \
+  -v /path/to/DeepSeek-V4-Flash-Vision-Exp:/model:ro \
+  --shm-size=16g -p 8098:8000 \
+  vllm-sm80:latest vllm serve /model \
+  --served-model-name DeepSeek-V4-Flash-Vision-Exp \
+  --pipeline-parallel-size 4 --kv-cache-dtype fp8 \
+  --block-size 256 --max-model-len 1048576 \
+  --max-num-batched-tokens 2048 --max-num-seqs 128 \
+  --gpu-memory-utilization 0.85 --trust-remote-code \
+  --no-enable-flashinfer-autotune \
+  --tokenizer-mode deepseek_v4 \
+  --disable-chunked-mm-input \
+  --limit-mm-per-prompt '{"image":2}' \
+  --mm-processor-cache-gb 4 \
+  --enable-prefix-caching \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
+  --enable-prompt-tokens-details \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":3}'
+```
+
+GLM-5.3-Flash on five cards:
 
 ```bash
 docker run -d --name vllm --runtime=nvidia \
@@ -88,105 +323,89 @@ docker run -d --name vllm --runtime=nvidia \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
+Qwen3.8-Flash-Next on four cards:
+
+```bash
+docker run -d --name vllm --runtime=nvidia --ipc=host \
+  -e NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
+  -e VLLM_PLE_CPU_OFFLOAD=1 \
+  -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600 \
+  -e VLLM_MARLIN_REPACK_HOLDOFF=1 \
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -v /path/to/Qwen3.8-Flash-Next-FP8:/model:ro \
+  -p 8099:8000 \
+  vllm-sm80:latest vllm serve /model \
+  --served-model-name Qwen3.8-Flash-Next \
+  --pipeline-parallel-size 4 --block-size 256 \
+  --max-model-len 1000000 --max-num-seqs 8 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.85 \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --no-async-scheduling --trust-remote-code \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --hf-overrides '{"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
+```
+
+Every launch above reports `context_window` in `/v1/models` next to
+`max_model_len`. Clients that only read `context_window` otherwise fall back to
+262,144 and truncate long prompts.
+
+Settings that are easy to get wrong:
+
 | Setting | Reason |
 | --- | --- |
-| `--block-size 256` | The indexer requires a multiple of 128. The sparse MLA backend requires a multiple of 64. |
-| `VLLM_PP_LAYER_PARTITION` | The last rank also carries `lm_head` and the MTP draft layer. |
-| `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | `143360` is aligned to 16 Mamba pages with fp8 KV. Use `73728` with bfloat16 KV. |
-| `VLLM_MARLIN_REPACK_HOLDOFF` | Avoids a load-time MMU fault observed with CMP 170HX and driver 610.43.02. Other systems can set it to `0`. |
-| `--kv-cache-memory` | Prevents Mamba state copies from evicting every hashed checkpoint when the default pool is too small. |
+| `--block-size 256` | The DeepSeek and GLM indexer needs a multiple of 128, and the sparse MLA backend needs a multiple of 64. |
+| `VLLM_PP_LAYER_PARTITION` | The last rank also carries `lm_head` and the draft layer, so give it fewer decoder layers. DeepSeek Vision is validated only at `12,12,12,7`. |
+| `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | Align it to the model's hybrid block size. DeepSeek uses 4096. GLM uses 143360 with fp8 KV and 73728 with bfloat16 KV. |
+| `VLLM_MARLIN_REPACK_HOLDOFF` | Avoids a load time MMU fault seen on CMP 170HX with driver 610.43.02. Set it to 0 elsewhere. |
+| `--kv-cache-memory` | GLM only. Stops Mamba state copies from evicting every hashed checkpoint when the default pool is too small. |
+| `--max-num-seqs` | For Qwen this is the real concurrency ceiling. Streams above it only queue. |
+| `VLLM_APC_HEADROOM_BLOCKS` | Keeps 32 blocks without hashes for state copies. Set it to 0 on tiny pools, including when running the prefix cache unit tests. |
 
-Known GLM limitations:
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Illegal memory access during weight load, in the Marlin repack | A caching allocator and driver 610.43.02 interaction on CMP 170HX. Set `VLLM_MARLIN_REPACK_HOLDOFF=1`. It empties the cache on entry, holds every temporary alive for the call, and synchronizes each iteration. The synchronize is load bearing. |
+| GPUs stop creating CUDA contexts after a crash | Reload the driver modules (`rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia`, then `modprobe nvidia`) rather than `nvidia-smi --gpu-reset`. On this stack the reset has made things worse. Kill anything holding `/dev/nvidia*` first, `nvtop` included. |
+| Engine dead but the HTTP server still answers | The worker died and executor shutdown stalled. `restart: always` cannot fire because the container is still up. Restart it by hand. |
+| Prefix cache hits collapse to zero after several long prompts | The pool is too small for the working set, so state copies evict hashed checkpoints. Raise `--kv-cache-memory`. |
+| Prefix cache unit tests fail on small pools | Set `VLLM_APC_HEADROOM_BLOCKS=0`. The default of 32 reserved blocks is larger than the pools those tests build. |
+| Long prompts crash only once the pool grows | Fixed here. Sparse MLA offsets used to overflow int32 above 4,194,304 cache rows. Upstream kernels carry the same latent bug and only avoid it with smaller pools. |
+
+## Known limits
 
 | Item | Detail |
 | --- | --- |
-| KDA numerics | Some tests differ from the reference by about 7 percent. |
-| KV capacity | Mamba state pages alias into larger blocks, so effective capacity is below the raw allocation. |
-| Transient headroom | The allocator keeps 32 blocks without hashes for Mamba state copies. Set `VLLM_APC_HEADROOM_BLOCKS=0` to disable it. |
-| FP8 KV prefill | Prefill is about 1.8 times slower than bfloat16 KV at tested shapes. Decode speed is similar. The larger cache reduces repeated prefill. |
-| Checkpoint indexes | This fork ignores `input_scale` entries that are not used by the W4A16 path, so old and new indexes both load. |
-
-## DeepSeek V4 Flash Vision
-
-This fork adds an experimental path for
-`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` on sm_80. The source candidate is
-[`bc3da91c8`](https://github.com/vowstar/vllm-sm80/commit/bc3da91c83889ecb228da3dc86a4f145a1abb016).
-
-| Check | State |
-| --- | --- |
-| Vision source implementation | Complete |
-| Immutable candidate image | Built, not promoted |
-| Full checkpoint load | Pending |
-| PP4 boot on four CMP 170HX GPUs | Pending |
-| Image understanding and OCR | Pending |
-| 1,048,576 token YaRN context | Pending |
-| DSpark and MTP | Pending live checks |
-| KV offload | Pending live checks |
-| Prefix cache hit, eviction, and refill | Pending live checks |
-| Sustained workload | Pending |
-
-Implemented Vision changes:
-
-| Area | Change |
-| --- | --- |
-| Model support | Adds the Vision tower, multimodal processor, registration, and weight loading. |
-| Image routing | Routes image tokens through the `bias_vl` MoE path. |
-| PrefixLM | Adds multimodal placeholders and image-local PrefixLM attention. |
-| Ampere | Adds sparse sliding attention for image tokens on sm_80. |
-| Pipeline parallelism | Carries vision metadata across PP ranks. |
-| Speculative decoding | Adds the DeepSeek V4 DSpark path for pipeline parallel execution. |
-| Embedding safety | Guards image token lookups before text embedding access. |
-| Tests | Adds model, multimodal, PrefixLM, router, and sm_80 coverage. |
-
-Promotion requires image understanding, OCR, three 1M-context needle checks,
-working speculative decoding, KV offload restore, prefix-cache eviction and
-refill, and a 600 second workload without request failures, Xid, AER, or
-container restarts.
-
-## Qwen3.8-Flash-Next
-
-Qwen3.8-Flash-Next-FP8 was tested on five CMP 170HX GPUs. This repository
-contains a rebased and adapted snapshot of the first two
-[PR #53899](https://github.com/vllm-project/vllm/pull/53899) commits from the
-`f561eca6c` period. A historical Docker image added four uncommitted
-compatibility patches and produced the measurements below.
-
-The current Git tree contains only the Ampere GDN declaration-guard fix. That
-fix later entered upstream through
-[PR #52743](https://github.com/vllm-project/vllm/pull/52743). It does not
-contain the three PP5 PLE and model-state patches used by the historical image.
-The PP5 result is therefore not reproducible from this tree alone. This
-repository does not claim
-Qwen3.8-Flash-Next PP5, MTP, vision, long-context, or concurrency support.
-
-| Test | Result |
-| --- | --- |
-| PP5 without MTP | Boots and serves requests |
-| Single-stream decode | 57.3 tok/s |
-| Prefill | About one third of DeepSeek-V4-Flash-0731 on the same hardware |
-| Concurrency 8 | Scaling was nearly flat |
-| Concurrency 32 | A worker died and the engine stopped |
-| MTP with PP5 | Fails with a CUDA illegal memory access in the target-model speculative path |
-
-Repeated illegal memory accesses can leave the GPUs unable to create new CUDA
-contexts until the driver state is recovered. The current upstream Qwen path
-does not implement pipeline-parallel MTP for this topology. For these reasons,
-this repository does not provide a production launch recipe for Qwen yet.
+| KDA numerics | Some GLM tests differ from the reference by about 7 percent. |
+| Hybrid KV capacity | Mamba state pages alias into larger blocks, so effective capacity is below the raw allocation. |
+| FP8 KV prefill | About 1.8 times slower than bfloat16 KV. Decode speed is similar and the larger cache avoids repeated prefill. |
+| Qwen host RAM | About 63 GB for the container, most of it the PLE table. Do not cold start two engines at once. |
+| Qwen MTP | Not implemented for pipeline parallelism, upstream included. |
+| No peer to peer | These cards stage GPU to GPU through host RAM at about 3 GB/s, so never use tensor parallelism. |
+| Prefix cache tests | `tests/v1/core/test_prefix_caching.py` has 17 failures on this branch. Six come from the `VLLM_APC_HEADROOM_BLOCKS` default and clear at 0. The rest are unexplained and predate the current work. |
+| NIXL connector | `register_kv_caches` has undefined names left from a merge. Nothing here passes `--kv-transfer-config`. |
 
 ## Attribution
 
 | Work | Author |
 | --- | --- |
 | GLM-5.3-Flash support, vLLM PR #53906 | ZJY0516 |
+| Qwen3.8-Flash-Next support, vLLM PR #53899 | the PR authors |
 | Mamba align boundary fix, vLLM PR #53479 | kamb-code |
 | Scheduler speculative decode padding fix, vLLM PR #53962 | njhill |
+| Ampere GDN guard, vLLM PR #52743 | the PR author |
 | CMP 170HX method reference | allover326/deepseek-v4-cmp170hx |
 
 ## History and maintenance
 
-The repository uses one active branch, `main`. Pre-consolidation tips are
-preserved as `archive/*-20260901` tags. Runtime deployment files live outside
-this source repository.
+This fork branches from upstream vLLM at `648b7468b`. Everything above that
+commit is either this fork's work or a cherry pick named in the attribution
+table.
+
+One active branch, `main`. Pre consolidation tips are kept as
+`archive/*-20260901` tags.
 
 This is a personal production fork. When upstream vLLM provides equivalent
-sm_80 support, this repository will link to the upstream implementation.
+sm_80 support, this repository will point at the upstream implementation.
