@@ -1512,6 +1512,36 @@ def test_per_request_spec_decode_subtracts_invalid_drafts():
     assert payload["acceptance_histogram"] == [0, 0, 1, 0]
 
 
+def test_per_request_spec_decode_caps_acceptance_at_valid_drafts():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        per_request_spec_decode_metrics="summary",
+    )
+    # A structured grammar can terminate after two drafts. The third draft is
+    # then invalid, although the sampler can still return all three positions.
+    req = _run_spec_verify_steps(
+        scheduler,
+        [([1, 2, 3], [1, 2, 3, 4])],
+        num_invalid_per_round=[1],
+    )
+    payload = scheduler.requests[req.request_id].spec_decode_metrics.to_dict()
+    assert payload["num_draft_tokens"] == 2
+    assert payload["num_accepted_draft_tokens"] == 2
+    assert payload["acceptance_histogram"] == [0, 0, 1, 0]
+    assert payload["draft_acceptance_rate"] == 1.0
+
+    stats = scheduler.make_spec_decoding_stats(
+        None,
+        num_draft_tokens=3,
+        num_accepted_tokens=3,
+        num_invalid_spec_tokens={"request": 1},
+        request_id="request",
+    )
+    assert stats is not None
+    assert stats.num_draft_tokens == 2
+    assert stats.num_accepted_tokens == 2
+
+
 def test_per_request_spec_decode_acceptance_disabled_by_default():
     scheduler = create_scheduler(num_speculative_tokens=3)
     assert scheduler.spec_decode_metrics_level == "none"

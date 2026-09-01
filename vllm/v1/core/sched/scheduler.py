@@ -1955,6 +1955,19 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+
+                # Structured-output validation can invalidate a suffix of the
+                # scheduled drafts. The sampler may still return those suffix
+                # positions after the grammar has terminated, so cap the
+                # metrics-only acceptance count at the number of valid drafts.
+                # Keep the raw counts above for scheduler rollback semantics.
+                num_invalid = 0
+                if scheduler_output.num_invalid_spec_tokens:
+                    num_invalid = scheduler_output.num_invalid_spec_tokens.get(
+                        req_id, 0
+                    )
+                metric_num_draft_tokens = max(num_draft_tokens - num_invalid, 0)
+                metric_num_accepted = min(num_accepted, metric_num_draft_tokens)
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1963,17 +1976,9 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
                 if request.spec_decode_metrics is not None:
-                    # Exclude grammar-invalidated drafts from the proposed
-                    # count, mirroring make_spec_decoding_stats; the accepted
-                    # bucket (j) is unaffected.
-                    adj_draft_tokens = num_draft_tokens
-                    if scheduler_output.num_invalid_spec_tokens:
-                        adj_draft_tokens -= (
-                            scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
-                        )
                     request.spec_decode_metrics.observe(
-                        num_draft_tokens=adj_draft_tokens,
-                        num_accepted=num_accepted,
+                        num_draft_tokens=metric_num_draft_tokens,
+                        num_accepted=metric_num_accepted,
                         detailed=self.spec_decode_metrics_level == "detailed",
                     )
 
@@ -2764,7 +2769,10 @@ class Scheduler(SchedulerInterface):
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
         if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+            num_draft_tokens = max(
+                num_draft_tokens - num_invalid_spec_tokens.get(request_id, 0), 0
+            )
+            num_accepted_tokens = min(num_accepted_tokens, num_draft_tokens)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
