@@ -569,6 +569,8 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         ]
+        if self.hyper_connection_mixer is None:
+            skip_substrs.append("hyper_connection_mixer")
         loader = AutoWeightsLoader(
             self,
             skip_substrs=skip_substrs,

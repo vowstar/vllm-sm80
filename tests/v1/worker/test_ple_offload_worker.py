@@ -299,7 +299,7 @@ def test_ple_offload_accepts_supported_configurations(
         data_parallel_backend="mp",
         data_parallel_size_local=1,
         data_parallel_size=1,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=4,
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
         enable_expert_parallel=enable_expert_parallel,

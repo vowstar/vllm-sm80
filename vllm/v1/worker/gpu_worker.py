@@ -217,7 +217,7 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._ple_offload_worker_handle: Any | None = None
-        self._ple_offload_enabled = self._has_ple_layers()
+        self._ple_offload_enabled = self._has_ple_layers() and self.rank == 0
         if envs.VLLM_PLE_CPU_OFFLOAD:
             if self._ple_offload_enabled:
                 self._validate_ple_offload_config()
@@ -261,8 +261,6 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:

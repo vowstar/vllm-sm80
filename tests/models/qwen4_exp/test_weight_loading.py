@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
+from vllm.models.qwen4_exp.nvidia import model as qwen4_exp_model
 from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
@@ -140,6 +144,36 @@ def test_only_qsa_main_cache_scales_move_to_the_merged_owner(
     model_name: str,
 ) -> None:
     assert _remap_qsa_cache_scale_name(checkpoint_name, frozenset({0})) == model_name
+
+
+@pytest.mark.parametrize(
+    ("has_final_mixer", "expected_skip"),
+    [(False, True), (True, False)],
+)
+def test_non_last_pp_rank_skips_final_mixer_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    has_final_mixer: bool,
+    expected_skip: bool,
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    class CapturingLoader:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["skip_substrs"] = list(kwargs["skip_substrs"])
+
+        def load_weights(self, *args: object, **kwargs: object) -> set[str]:
+            return set()
+
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=0)
+    model._qsa_layer_ids = frozenset()
+    model.hyper_connection_mixer = torch.nn.Identity() if has_final_mixer else None
+    monkeypatch.setattr(qwen4_exp_model, "AutoWeightsLoader", CapturingLoader)
+
+    model.load_weights([])
+
+    assert ("hyper_connection_mixer" in captured["skip_substrs"]) is expected_skip
 
 
 @pytest.mark.parametrize(

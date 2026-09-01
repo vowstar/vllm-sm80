@@ -443,7 +443,14 @@ def test_qwen4_exp_model_state_skips_ngram_state_without_ple() -> None:
         assert model_state.prepare_dummy_inputs(1, 1) is base_inputs
 
 
-def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
+@pytest.mark.parametrize(
+    ("is_first_rank", "expected_ngram_state"),
+    [(True, True), (False, False)],
+)
+def test_qwen4_exp_model_state_limits_ngram_state_to_first_pp_rank(
+    is_first_rank: bool,
+    expected_ngram_state: bool,
+) -> None:
     def init_base_state(
         state,
         vllm_config,
@@ -457,20 +464,36 @@ def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
 
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=[1],
+                ngram_size=4,
+                eos_token_id=99,
+            ),
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
     )
     with (
         patch.object(MambaHybridModelState, "__init__", init_base_state),
-        pytest.raises(RuntimeError, match="pipeline_parallel_size=1"),
+        patch(
+            "vllm.distributed.get_pp_group",
+            return_value=SimpleNamespace(is_first_rank=is_first_rank),
+        ),
     ):
-        Qwen4ExpModelState(
+        model_state = Qwen4ExpModelState(
             vllm_config,
             torch.nn.Identity(),
             None,
             torch.device("cpu"),
         )
+
+    assert model_state.uses_ngram_embedding is expected_ngram_state
+    if expected_ngram_state:
+        assert model_state.ngram_context.shape == (4, 3)
+        assert model_state.ple_query_start_loc.shape == (5,)
+    else:
+        assert model_state.ngram_context_len == 0
+        assert model_state.ngram_eos_token_id == 0
+        assert not hasattr(model_state, "ngram_context")
 
 
 def test_qwen4_exp_ple_builder_receives_spec_decode_metadata() -> None:

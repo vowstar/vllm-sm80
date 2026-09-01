@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 
 import vllm._custom_ops as ops
@@ -288,6 +290,11 @@ def prepare_fp8_moe_layer_for_marlin(
     # WEIGHT
     # Repack weights to marlin format
     def repack_weight(name: str, weight: torch.Tensor) -> torch.Tensor:
+        holdoff = os.environ.get("VLLM_MARLIN_REPACK_HOLDOFF", "0") == "1"
+        keepalive: list[torch.Tensor] | None = [] if holdoff else None
+        if holdoff:
+            torch.cuda.empty_cache()
+
         tensor_list = []
         size_n, size_k = weight.size(1), weight.size(2)
         for i in range(e):
@@ -298,8 +305,17 @@ def prepare_fp8_moe_layer_for_marlin(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
             tensor_list.append(marlin_qweight)
+            if keepalive is not None:
+                keepalive.extend((qweight, marlin_qweight))
+                torch.cuda.synchronize()
 
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        repacked = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        if keepalive is not None:
+            torch.cuda.synchronize()
+            tensor_list.clear()
+            keepalive.clear()
+            torch.cuda.empty_cache()
+        return repacked
 
     w13_weight = repack_weight("w13", w13_weight)
     w2_weight = repack_weight("w2", w2_weight)

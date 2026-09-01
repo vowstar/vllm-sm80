@@ -456,6 +456,101 @@ def test_marlin_prepare_layer_preserves_workspace_address(monkeypatch, variant):
     assert torch.all(layer.workspace == 0)
 
 
+@pytest.mark.parametrize(
+    ("holdoff", "expected_syncs", "expected_cache_clears"),
+    [(False, 0, 0), (True, 6, 4)],
+)
+def test_fp8_moe_repack_holdoff(
+    monkeypatch: pytest.MonkeyPatch,
+    holdoff: bool,
+    expected_syncs: int,
+    expected_cache_clears: int,
+) -> None:
+    from vllm.model_executor.layers.quantization.utils import marlin_utils_fp8
+
+    calls: list[str] = []
+    if holdoff:
+        monkeypatch.setenv("VLLM_MARLIN_REPACK_HOLDOFF", "1")
+    else:
+        monkeypatch.delenv("VLLM_MARLIN_REPACK_HOLDOFF", raising=False)
+
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "get_marlin_input_dtype",
+        lambda: torch.float16,
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "marlin_moe_padded_intermediate",
+        lambda size, group_size: size,
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "marlin_make_workspace_new",
+        lambda *args, **kwargs: torch.zeros(1, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8.ops,
+        "gptq_marlin_repack",
+        lambda **kwargs: kwargs["b_q_weight"].clone(),
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "marlin_permute_scales",
+        lambda s, **kwargs: s.clone(),
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "fp8_fused_exponent_bias_into_scales",
+        lambda scales: scales,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda: calls.append("sync"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: calls.append("empty_cache"),
+    )
+
+    num_experts = 2
+    hidden_size = 8
+    intermediate_size = 8
+    w13 = torch.zeros(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+    )
+    w2 = torch.zeros(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.float8_e4m3fn,
+    )
+    layer = Mock(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size,
+        weight_block_size=None,
+        w13_weight=w13,
+        orig_dtype=torch.float16,
+    )
+
+    marlin_utils_fp8.prepare_fp8_moe_layer_for_marlin(
+        layer,
+        w13,
+        w2,
+        torch.ones(num_experts),
+        torch.ones(num_experts),
+    )
+
+    assert calls.count("sync") == expected_syncs
+    assert calls.count("empty_cache") == expected_cache_clears
+
+
 def test_marlin_make_workspace_new_rejects_incompatible_existing(monkeypatch):
     """An incompatible existing workspace means the address captured by CUDA
     graphs is already unusable; allocating a replacement would hide that."""
