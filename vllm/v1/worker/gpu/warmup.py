@@ -209,6 +209,28 @@ def run_mixed_prefill_decode_warmup(
     return True
 
 
+
+def _has_qsa_indexer(model_runner: GPUModelRunner) -> bool:
+    """True when the model has a Qwen4Exp QSA indexer (``index_n_heads`` plus
+    the raw/compressed side caches). GLM's KDA and DeepSeek's MLA layers never
+    carry these attributes, so this cleanly gates Qwen-only warmup."""
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        return False
+    return any(
+        all(
+            hasattr(module, attr)
+            for attr in (
+                "index_n_heads",
+                "compress_ratio",
+                "raw_key_cache",
+                "compressed_key_cache",
+            )
+        )
+        for module in model.modules()
+    )
+
+
 @torch.inference_mode()
 def warmup_kernels(
     model_runner: GPUModelRunner,
@@ -225,12 +247,15 @@ def warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
-    # A realistic-length prefill (4096 tokens) so prefill-only kernels that
-    # specialize on large shapes -- Qwen4 QSA's indexer and sparse attention,
-    # which the AOT/torch.compile path compiles separately from a direct
-    # Triton JIT call -- warm before serving. It still exceeds decode_query_len
-    # so the batch is not misclassified as uniform decode.
-    prompt_len = max(decode_query_len + 1, 4096)
+    # Use decode_query_len + 1 so the prefill batch is not misclassified as a
+    # uniform decode batch.
+    prompt_len = decode_query_len + 1
+    if _has_qsa_indexer(model_runner):
+        # Qwen4 QSA's indexer and sparse-attention kernels are AOT-compiled
+        # through torch.compile and specialize on large prefill shapes. A
+        # realistic 4096-token prefill warms them; other models keep the tiny
+        # prompt so their warmup and block budget are unchanged.
+        prompt_len = max(prompt_len, 4096)
     prompt_token_ids = list(range(prompt_len))
     # Intermediate decode batch sizes to warm, on top of the 1 / 2 / num_reqs
     # that `decode_steps` below already covers.
