@@ -11,6 +11,9 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fused_moe.utils import (
+    is_model_fused_shared_expert_compatible,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -415,6 +418,11 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+            self.layers,
+            Qwen4ExpSparseMoeBlock,
+            "mlp",
+        )
         intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], intermediate_size
@@ -558,26 +566,36 @@ class Qwen4ExpModel(nn.Module):
         )
         weights = maybe_fuse_shared_experts(
             weights,
+            enabled=self.is_fused_shared_expert_enabled,
             n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        # The final mixer is built with use_combine=False, so it drops the
-        # checkpoint's block_inject_weight column; on non-last PP ranks the
-        # whole hyper_connection_mixer module is absent. Non-persistent PLE
-        # state (hashstats_*, token_lookup) is already excluded by
-        # Qwen4ExpPLELayer.load_weights, so it needs no ignore entry here.
-        ignore_unexpected_prefixes = ["hyper_connection_mixer.block_inject_weight"]
-        if self.hyper_connection_mixer is None:
-            ignore_unexpected_prefixes.append("hyper_connection_mixer")
+        # Non-persistent PLE state rebuilt in __init__; skip any ckpt
+        # column for them.
+        skip_substrs = (
+            "hashstats_",
+            "token_lookup",
+            "hyper_connection_mixer.block_inject_weight",
+        )
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+            orig_to_new_substr={substr: None for substr in skip_substrs}
+        )
+        # The final HC mixer only exists on the last PP rank; earlier ranks
+        # must drop its checkpoint weights instead of failing to place them.
+        ignore_prefixes = (
+            None
+            if self.hyper_connection_mixer is not None
+            else ["hyper_connection_mixer."]
+        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_prefixes=ignore_unexpected_prefixes,
+            ignore_unexpected_prefixes=ignore_prefixes,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(
             weights,
-            mapper=self.hf_to_vllm_mapper,
+            mapper=mapper,
         )
         return loaded
 
@@ -800,12 +818,14 @@ class Qwen4ExpForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+            orig_to_new_substr={"mtp.": None}
+        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_prefixes=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -991,14 +1011,15 @@ class Qwen4ExpForConditionalGeneration(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+            orig_to_new_substr={"mtp.": None},
+            orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
+        )
         loader = AutoWeightsLoader(
             self,
-            ignore_unexpected_prefixes=(
-                ["visual.", "mtp."] if self.language_model_only else ["mtp."]
-            ),
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
