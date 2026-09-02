@@ -316,14 +316,19 @@ def _warm_qsa_kernels(
     raw_cache = indexer.raw_key_cache.kv_cache
     comp_cache = indexer.compressed_key_cache.kv_cache
     max_len = int(getattr(model_config, "max_model_len", 0) or 0)
-    # The block table row length is cdiv(max_len, cache block_size) -- the
-    # scheduler's storage block size, NOT the compressed cache's state count
-    # (comp_cache.shape[1] is the per-block state count, 14336 here, which
-    # would shrink the table to 70 rows and compile the wrong specialization).
     cache_block_size = int(getattr(runner.cache_config, "block_size", 0) or 0)
-    page_table_width = (
+    # Two block-table widths. The main attention cache's table is
+    # cdiv(max_len, cache block_size) = 559. The compressed side cache's one
+    # block holds comp_cache.shape[1] states x compress_ratio tokens each
+    # (14336 x 4 = 57344 tokens here), so its table is cdiv(max_len, that) = 18.
+    main_page_table_width = (
         (max_len + cache_block_size - 1) // cache_block_size
         if max_len and cache_block_size else 0
+    )
+    tokens_per_comp_block = int(comp_cache.shape[1]) * compress_ratio
+    comp_page_table_width = (
+        (max_len + tokens_per_comp_block - 1) // tokens_per_comp_block
+        if max_len and tokens_per_comp_block else 0
     )
 
     hf_text_config = getattr(model_config, "hf_text_config", None)
@@ -332,11 +337,16 @@ def _warm_qsa_kernels(
     main_head_dim = int(getattr(hf_text_config, "head_dim", 0) or 0)
     logger.info(
         "QSA warmup config: indexer heads=%d head_dim=%d ratio=%d topk=%d "
-        "page_table_width=%d cache_block_size=%d main(q=%d,kv=%d,hd=%d).",
-        n_heads, head_dim, compress_ratio, token_topk, page_table_width,
-        cache_block_size, num_q_heads, num_kv_heads, main_head_dim,
+        "comp_width=%d main_width=%d cache_block_size=%d main(q=%d,kv=%d,hd=%d).",
+        n_heads, head_dim, compress_ratio, token_topk, comp_page_table_width,
+        main_page_table_width, cache_block_size, num_q_heads, num_kv_heads,
+        main_head_dim,
     )
-    num_reqs = 1
+    # Triton specializes the mqa and splitk kernels on num_requests (the block
+    # table's request dim) at the exact value, so warm every batch size the
+    # scheduler can produce. A missed size JITs on its first request and, on a
+    # pipeline-parallel rank, can land inside a collective and deadlock.
+    num_reqs_choices = tuple(range(1, 33))
     bf16 = torch.bfloat16
 
     # Kernels 2+3: _qsa_mqa_paged_kernel and _expand_qsa_indices_kernel.
@@ -353,42 +363,42 @@ def _warm_qsa_kernels(
 
     block_topk = token_topk // compress_ratio
     logger.info(
-        "QSA mqa warmup: comp_cache %s dtype=%s; page_table w=%d; "
-        "token_to_req/query_positions/seq_lens = int32/int64/int32.",
-        tuple(comp_cache.shape), comp_cache.dtype, page_table_width,
+        "QSA mqa warmup: comp_cache %s dtype=%s; comp page_table w=%d.",
+        tuple(comp_cache.shape), comp_cache.dtype, comp_page_table_width,
     )
-    for rows in (1, 33):
-        q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
-        page_table = torch.zeros(
-            (num_reqs, page_table_width), dtype=torch.int32, device=device
-        )
-        token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-        # query_positions is logical_positions on the real path, int64.
-        query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
-        sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
-        qsa_mqa_paged(
-            q,
-            comp_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            compress_ratio,
-            num_columns=4096,
-        )
-        block_indices = torch.zeros(
-            (rows, block_topk), dtype=torch.int32, device=device
-        )
-        out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
-        expand_qsa_block_indices_cuda(
-            block_indices,
-            query_positions,
-            sequence_lengths,
-            token_to_req,
-            compress_ratio,
-            token_topk,
-            out,
-        )
+    for num_reqs in num_reqs_choices:
+        for rows in (1, 33):
+            q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
+            page_table = torch.zeros(
+                (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
+            )
+            token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+            # query_positions is logical_positions on the real path, int64.
+            query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+            sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
+            qsa_mqa_paged(
+                q,
+                comp_cache,
+                page_table,
+                token_to_req,
+                query_positions,
+                sequence_lengths,
+                compress_ratio,
+                num_columns=4096,
+            )
+            block_indices = torch.zeros(
+                (rows, block_topk), dtype=torch.int32, device=device
+            )
+            out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
+            expand_qsa_block_indices_cuda(
+                block_indices,
+                query_positions,
+                sequence_lengths,
+                token_to_req,
+                compress_ratio,
+                token_topk,
+                out,
+            )
 
     # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
     # are picked from base_programs = rows * num_kv_heads, so walk every
@@ -398,7 +408,7 @@ def _warm_qsa_kernels(
     attention = _find_qsa_attention(runner)
     if (
         attention is not None
-        and num_q_heads and num_kv_heads and main_head_dim and page_table_width
+        and num_q_heads and num_kv_heads and main_head_dim and main_page_table_width
     ):
         attn_head_dim = int(attention.head_dim)
         key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
@@ -408,20 +418,22 @@ def _warm_qsa_kernels(
             "QSA splitk warmup: live cache %s -> key_cache %s.",
             tuple(attention.kv_cache.shape), tuple(key_cache.shape),
         )
-        for rows in (1, 2, 8, 16, 128, 256, 300):
-            q = torch.empty(
-                (rows, num_q_heads, attn_head_dim), dtype=bf16, device=device
-            )
-            logical_indices = torch.zeros(
-                (rows, output_width), dtype=torch.int32, device=device
-            )
-            block_table = torch.zeros(
-                (num_reqs, page_table_width), dtype=torch.int32, device=device
-            )
-            token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-            qsa_sparse_paged_attention(
-                q, key_cache, value_cache, logical_indices, block_table, token_to_req
-            )
+        for num_reqs in num_reqs_choices:
+            for rows in (1, 2, 8, 16, 128, 256, 300):
+                q = torch.empty(
+                    (rows, num_q_heads, attn_head_dim), dtype=bf16, device=device
+                )
+                logical_indices = torch.zeros(
+                    (rows, output_width), dtype=torch.int32, device=device
+                )
+                block_table = torch.zeros(
+                    (num_reqs, main_page_table_width), dtype=torch.int32, device=device
+                )
+                token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+                qsa_sparse_paged_attention(
+                    q, key_cache, value_cache, logical_indices, block_table,
+                    token_to_req,
+                )
 
     # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on
     # num_tokens <= 4096, so warm both sides. num_k_work = 0 compiles the whole
@@ -454,12 +466,10 @@ def _warm_qsa_kernels(
             (num_tokens, n_heads, head_dim), dtype=bf16, device=device
         )
         state_slots = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        state_block_table = torch.zeros(
-            (num_reqs, 1), dtype=torch.int32, device=device
-        )
-        query_start_loc = torch.zeros(
-            num_reqs + 1, dtype=torch.int32, device=device
-        )
+        # The k-compress branch is compiled but never run (num_k_work=0), so a
+        # single request suffices for the raw-cache block table (width 1).
+        state_block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+        query_start_loc = torch.zeros(2, dtype=torch.int32, device=device)
         logical_positions = torch.zeros(
             num_tokens, dtype=torch.int64, device=device
         )
