@@ -447,11 +447,24 @@ def warmup_kernels(
 
         # Intermediate batch sizes, so no size first appears during inference.
         # Sizes at or above num_reqs are already covered by the full-batch step.
-        for size in warmup_batch_ladder:
-            if 2 < size < num_reqs:
-                decode_steps.append(
-                    (list(range(size)), [use_spec_decode] * size)
-                )
+        #
+        # These go FIRST, smallest first, and that ordering is load-bearing on
+        # this hardware. A Triton kernel is loaded into the CUDA context on its
+        # first launch, and on a CMP 170HX with driver 610.43.02 the
+        # cuModuleLoadData behind that first launch of _post_update_kernel
+        # spins at 100 percent CPU inside libcuda and never returns when the
+        # launch grid is large. Measured: the load completes normally at grid 8
+        # and 16 and never completes at grid 32, with 14.7 GiB of VRAM free, so
+        # it is neither compilation nor memory pressure. Loading the module on
+        # a small grid first makes every later launch reuse the already loaded
+        # module, and _init_handles returns immediately. Nothing about this
+        # ordering can hurt a driver that does not have the defect: it is the
+        # same steps in a different order, cheapest first.
+        decode_steps[:0] = [
+            (list(range(size)), [use_spec_decode] * size)
+            for size in warmup_batch_ladder
+            if 2 < size < num_reqs
+        ]
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
