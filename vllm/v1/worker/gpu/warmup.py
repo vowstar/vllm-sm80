@@ -230,10 +230,38 @@ def warmup_kernels(
     # a uniform decode batch.
     prompt_len = decode_query_len + 1
     prompt_token_ids = list(range(prompt_len))
+    # Intermediate decode batch sizes to warm, on top of the 1 / 2 / num_reqs
+    # that `decode_steps` below already covers.
+    #
+    # Any batch size the scheduler can produce but warmup never ran will JIT its
+    # Triton kernels on first use. With pipeline parallelism that JIT lands
+    # inside a collective window: one rank enters cuModuleLoad, which needs the
+    # device to quiesce, while its peers spin inside an NCCL kernel waiting for
+    # it, and nothing ever completes. Measured on a PP4 deployment of
+    # Qwen3.8-Flash-Next, six kernels compiled during inference
+    # (_post_update_kernel, _qsa_pre_indexer_kernel, _qsa_mqa_paged_kernel,
+    # _qsa_sparse_paged_gqa_splitk_kernel, _expand_qsa_indices_kernel,
+    # _fused_post_conv_kernel). That stalled the warmup collective outright at
+    # --max-num-seqs 32, and at 16 concurrent requests it timed out
+    # sample_tokens and killed the engine.
+    #
+    # Warming powers of two costs a handful of extra decode steps. It cannot
+    # change behaviour for a model that already warms everything it needs; it
+    # only runs more of the same steps. The block budget below grows with the
+    # step count, but decode_len stays far under one block for every model here
+    # (prompt_len and decode_query_len are single digits), so the extra steps do
+    # not reduce the request count warmup can afford.
+    warmup_batch_ladder: list[int] = []
+    if not model_runner.is_pooling_model:
+        size = 4
+        while size < model_runner.scheduler_config.max_num_seqs:
+            warmup_batch_ladder.append(size)
+            size *= 2
+
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
     if not model_runner.is_pooling_model:
-        num_decode_steps = 5 if num_spec_steps > 0 else 3
+        num_decode_steps = (5 if num_spec_steps > 0 else 3) + len(warmup_batch_ladder)
     # Size the block allocation for the worst case: every request advancing
     # decode_query_len tokens on every decode step.
     decode_len = prompt_len + num_decode_steps * decode_query_len
@@ -416,6 +444,14 @@ def warmup_kernels(
                 decode_steps.append(([0], [False]))
         elif use_spec_decode:
             decode_steps.append(([0], [False]))
+
+        # Intermediate batch sizes, so no size first appears during inference.
+        # Sizes at or above num_reqs are already covered by the full-batch step.
+        for size in warmup_batch_ladder:
+            if 2 < size < num_reqs:
+                decode_steps.append(
+                    (list(range(size)), [use_spec_decode] * size)
+                )
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
