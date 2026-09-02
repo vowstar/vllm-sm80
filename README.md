@@ -148,7 +148,7 @@ against the other is the most common way these figures get misread:
 On a four-stage pipeline the gap between them is large and shrinks as the run
 gets longer, because a PP4 pipeline cannot reach steady state until enough
 requests are in flight. Measured on Qwen PP4, 5x CMP 170HX, prose prompts of
-about 1,765 tokens with unique prefixes so the prefix cache never hits:
+about 1,600 tokens with unique prefixes so the prefix cache never hits:
 
 | Concurrency | Output/req | Wall | aggregate | steady generation | per-request median |
 | --- | --- | --- | --- | --- | --- |
@@ -156,6 +156,8 @@ about 1,765 tokens with unique prefixes so the prefix cache never hits:
 | 4 | 512 | 25.3 s | 80.9 tok/s | 49.4 tok/s | 20.2 tok/s |
 | 8 | 512 | 19.7 s | 207.7 tok/s | 158.8 tok/s | 26.0 tok/s |
 | 8 | 2048 | 64.6 s | **253.7 tok/s** | **259.1 tok/s** | 31.7 tok/s |
+| 16 | 512 | 21.8 s | 375.5 tok/s | 432.5 tok/s | 23.5 tok/s |
+| 32 | 512 | 32.4 s | 506.0 tok/s | 644.3 tok/s | 15.8 tok/s |
 
 The last two rows are the same server and the same concurrency; only the
 output length differs. With 512-token outputs the run is too short for the
@@ -173,21 +175,14 @@ Avg generation throughput: 261.3 tokens/s, Running: 8 reqs, Prefix cache hit rat
 Avg generation throughput: 265.9 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
 ```
 
-With the warmup batch ladder in place, `--max-num-seqs 16` is the highest
-working setting for Qwen on this fork:
-
-| Concurrency | Output/req | aggregate | steady generation |
-| --- | --- | --- | --- |
-| 8 | 2048 | 253.7 tok/s | 259.1 tok/s |
-| 16 | 2048 | 353.5 tok/s | **467.2 tok/s** |
-
-`--max-num-seqs 32` still does not finish starting. Rank 0 stalls inside
-Triton's `_init_handles`, i.e. `cuModuleLoad`, for as long as it is left
-running; its GPU sits at 0 percent utilisation and its peers are correctly
-blocked in `recv`, so nothing on the device is holding it. The same kernel
-loads without trouble at 8 and 16. On the CMP 170HX with driver 610.43.02
-this is a driver-level module-load stall rather than a scheduling bug, and it
-is not fixed here.
+The QSA Triton kernels used to JIT on the first request. On a pipeline-parallel
+rank that JIT lands inside a collective: one rank enters `cuModuleLoad` while
+its peers spin in `recv`, and `--max-num-seqs 32` never finished starting. The
+fix pre-compiles the kernels during warmup: un-gate the Qwen model type in the
+Triton warmup, warm the four QSA kernels on their exact block-table widths and
+every batch size the scheduler can produce, and mark the runtime integer
+scalars `do_not_specialize` so they no longer recompile per shape. 16 and 32
+concurrent streams now serve with zero first-request JIT (see the table above).
 
 An earlier revision of this file claimed 32 streams at 804.8 tok/s aggregate
 with no crash. That did not survive re-measurement and has been removed.
