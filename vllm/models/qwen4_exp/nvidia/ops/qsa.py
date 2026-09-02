@@ -120,7 +120,7 @@ def _qsa_mqa_paged_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,

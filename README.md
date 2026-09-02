@@ -44,9 +44,8 @@ That is the whole build. Nothing else in this repository is required.
 
 ## Measured performance
 
-Two hosts, each five CMP 170HX 64 GB cards behind a shared PCIe uplink with no
-peer to peer. All three columns come from one harness against a live service
-with real technical prose as the prompt.
+All three columns come from one harness against a live service with real
+technical prose as the prompt.
 
 Use real prose. A prompt built from one repeated word makes speculative
 decoding accept almost everything at short context and almost nothing at long
@@ -141,13 +140,14 @@ service:
 | 1 | 39.7 tok/s | 63.8 tok/s | 69.2 tok/s |
 | 4 | 131.3 tok/s | 153.0 tok/s | 179.8 tok/s |
 | 8 | 221.9 tok/s | 188.3 tok/s | 215.2 tok/s |
+| 16 | 375.5 tok/s | 309.1 tok/s | 334.9 tok/s |
+| 32 | 506.0 tok/s | 432.8 tok/s | 426.6 tok/s |
 
-Per-request median at the same points: Qwen 39.7 / 32.8 / 27.8, GLM 63.8 /
-39.0 / 23.9, DeepSeek 80.3 / 49.9 / 29.9 tok/s. Qwen is slowest single-stream
-because it is the only one without speculative decoding, but scales best (5.6x
-from 1 to 8 streams) because its GDN linear attention batches cheaply. GLM and
-DeepSeek start faster (MTP and DSpark draft acceptance) but scale only about
-3x, and GLM's per-request latency degrades most at 8 streams.
+Per-request median at the same points: Qwen 39.7 / 32.8 / 27.8 / 23.5 / 15.8,
+GLM 63.8 / 39.0 / 23.9 / 20.0 / 14.0, DeepSeek 80.3 / 49.9 / 29.9 / 23.3 /
+14.0 tok/s. Qwen is slowest single-stream because it is the only one without
+speculative decoding, but scales best (12.7x from 1 to 32 streams) because its
+GDN linear attention batches cheaply; GLM and DeepSeek scale about 6.5x.
 
 **Two throughput numbers exist and they are not interchangeable.** Quoting one
 against the other is the most common way these figures get misread:
@@ -197,15 +197,9 @@ every batch size the scheduler can produce, and mark the runtime integer
 scalars `do_not_specialize` so they no longer recompile per shape. 16 and 32
 concurrent streams now serve with zero first-request JIT (see the table above).
 
-An earlier revision of this file claimed 32 streams at 804.8 tok/s aggregate
-with no crash. That did not survive re-measurement and has been removed.
-
-An earlier build killed the Qwen engine at 32 streams. The PLE offload request
-queue held one entry and the producer used `put_nowait`, which assumes each
-forward is consumed before the next launch. Pipeline parallelism runs the
-engine batch queue and breaks that assumption, so the queue filled, the rank 0
-worker raised `queue.Full`, and the engine died five minutes later on an RPC
-timeout. The producer now blocks on a 60 s bound, and 32 streams is stable.
+A separate fix was also needed for 32 streams: the PLE offload producer used
+`put_nowait` on a one-entry queue, which killed the engine under pipeline
+parallelism; it now blocks on a 60 s bound.
 
 ## DeepSeek V4 Flash and Vision
 
@@ -244,9 +238,9 @@ this fork's work.
 | PP4 serving | Works |
 | 1,000,000 token YaRN context | Works, from a native 262,144 |
 | PLE CPU offload under PP | Works |
-| 8 concurrent streams | Works, 259 tok/s steady generation, cold prefix cache |
-| 16 concurrent streams | Works, 467 tok/s steady generation |
-| 32 concurrent streams | Does not finish starting, driver-level module-load stall |
+| 8 concurrent streams | Works, 253 tok/s steady generation, cold prefix cache |
+| 16 concurrent streams | Works, 432 tok/s steady generation |
+| 32 concurrent streams | Works, 644 tok/s steady generation |
 | Prefix caching | Works |
 | Vision tower | Loads and warms up, image accuracy not checked |
 | MTP | Not available under PP |
@@ -374,7 +368,7 @@ docker run -d --name vllm --runtime=nvidia --ipc=host \
   vllm-sm80:latest vllm serve /model \
   --served-model-name Qwen3.8-Flash-Next \
   --pipeline-parallel-size 4 --block-size 256 \
-  --max-model-len 1000000 --max-num-seqs 8 \
+  --max-model-len 1000000 --max-num-seqs 32 \
   --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.85 \
   --enable-prefix-caching --enable-chunked-prefill \
