@@ -33,6 +33,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            # DELIBERATE DIVERGENCE from peakcrosser7/vllm, which raises here:
+            #   "N-gram PLE embedding currently requires pipeline_parallel_size=1
+            #    because non-first pipeline ranks do not receive the raw input_ids
+            #    required by PLE. Please run with PP=1."
+            # That is true of their deployment, not ours. Upstream validates this
+            # model on TP2 / TP4 / DP4+EP4 only and never on PP, while every
+            # deployment here is PP4 or PP5 -- the non-PLE weights alone are about
+            # 122 GB in FP8, so PP1 and PP2 do not fit on a 64 GiB card at all.
+            # Our answer is to disable the n-gram path on the ranks that cannot
+            # feed it rather than to refuse to start: only the first rank holds
+            # the embedding and sees raw input_ids, so later ranks simply have no
+            # n-gram work to do. Taking their hunk would break every Qwen service
+            # in this fleet at startup.
             from vllm.distributed import get_pp_group
 
             if not get_pp_group().is_first_rank:
