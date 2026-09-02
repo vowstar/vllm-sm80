@@ -173,14 +173,24 @@ Avg generation throughput: 261.3 tokens/s, Running: 8 reqs, Prefix cache hit rat
 Avg generation throughput: 265.9 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
 ```
 
-**Concurrency above 8 is not yet usable for Qwen on this fork.**
-`--max-num-seqs 16` starts and serves single requests but the engine dies
-under a 16-way load with `RPC call to sample_tokens timed out`.
-`--max-num-seqs 32` does not finish starting at all: it stalls inside the
-pipeline-parallel warmup collective. Both trace to the same cause, described
-under Known limits below. An earlier revision of this file claimed 32 streams
-at 804.8 tok/s aggregate; that claim did not survive re-measurement and has
-been removed.
+With the warmup batch ladder in place, `--max-num-seqs 16` is the highest
+working setting for Qwen on this fork:
+
+| Concurrency | Output/req | aggregate | steady generation |
+| --- | --- | --- | --- |
+| 8 | 2048 | 253.7 tok/s | 259.1 tok/s |
+| 16 | 2048 | 353.5 tok/s | **467.2 tok/s** |
+
+`--max-num-seqs 32` still does not finish starting. Rank 0 stalls inside
+Triton's `_init_handles`, i.e. `cuModuleLoad`, for as long as it is left
+running; its GPU sits at 0 percent utilisation and its peers are correctly
+blocked in `recv`, so nothing on the device is holding it. The same kernel
+loads without trouble at 8 and 16. On the CMP 170HX with driver 610.43.02
+this is a driver-level module-load stall rather than a scheduling bug, and it
+is not fixed here.
+
+An earlier revision of this file claimed 32 streams at 804.8 tok/s aggregate
+with no crash. That did not survive re-measurement and has been removed.
 
 An earlier build killed the Qwen engine at 32 streams. The PLE offload request
 queue held one entry and the producer used `put_nowait`, which assumes each
@@ -227,8 +237,8 @@ this fork's work.
 | 1,000,000 token YaRN context | Works, from a native 262,144 |
 | PLE CPU offload under PP | Works |
 | 8 concurrent streams | Works, 259 tok/s steady generation, cold prefix cache |
-| 16 concurrent streams | Starts, but the engine dies under load |
-| 32 concurrent streams | Does not finish starting |
+| 16 concurrent streams | Works, 467 tok/s steady generation |
+| 32 concurrent streams | Does not finish starting, driver-level module-load stall |
 | Prefix caching | Works |
 | Vision tower | Loads and warms up, image accuracy not checked |
 | MTP | Not available under PP |
