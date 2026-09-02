@@ -131,9 +131,23 @@ recurrent state instead of a growing cache, and because its launcher pins
 ### Throughput against concurrency
 
 The three models run different topologies (DeepSeek PP4 and PP5, Qwen PP4,
-GLM PP5) and different true-concurrency caps (`--max-num-seqs`). A shared
-throughput table is not published because those differences make one "streams"
-count mean different things per model.
+GLM PP5) and different true-concurrency caps (`--max-num-seqs`), so one
+"streams" count does not mean the same work per model. One harness, 512 output
+tokens, about 1,600-token prose prompts with unique prefixes, against each live
+service:
+
+| Concurrency | Qwen aggregate | GLM aggregate | DeepSeek aggregate |
+| --- | ---: | ---: | ---: |
+| 1 | 39.7 tok/s | 63.8 tok/s | 69.2 tok/s |
+| 4 | 131.3 tok/s | 153.0 tok/s | 179.8 tok/s |
+| 8 | 221.9 tok/s | 188.3 tok/s | 215.2 tok/s |
+
+Per-request median at the same points: Qwen 39.7 / 32.8 / 27.8, GLM 63.8 /
+39.0 / 23.9, DeepSeek 80.3 / 49.9 / 29.9 tok/s. Qwen is slowest single-stream
+because it is the only one without speculative decoding, but scales best (5.6x
+from 1 to 8 streams) because its GDN linear attention batches cheaply. GLM and
+DeepSeek start faster (MTP and DSpark draft acceptance) but scale only about
+3x, and GLM's per-request latency degrades most at 8 streams.
 
 **Two throughput numbers exist and they are not interchangeable.** Quoting one
 against the other is the most common way these figures get misread:
@@ -152,19 +166,18 @@ about 1,600 tokens with unique prefixes so the prefix cache never hits:
 
 | Concurrency | Output/req | Wall | aggregate | steady generation | per-request median |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 512 | 22.6 s | 22.7 tok/s | 38.9 tok/s | 22.7 tok/s |
-| 4 | 512 | 25.3 s | 80.9 tok/s | 49.4 tok/s | 20.2 tok/s |
-| 8 | 512 | 19.7 s | 207.7 tok/s | 158.8 tok/s | 26.0 tok/s |
+| 1 | 512 | 12.9 s | 39.7 tok/s | 39.6 tok/s | 39.7 tok/s |
+| 4 | 512 | 15.6 s | 131.3 tok/s | 142.4 tok/s | 32.8 tok/s |
+| 8 | 512 | 18.5 s | 221.9 tok/s | 252.8 tok/s | 27.8 tok/s |
 | 8 | 2048 | 64.6 s | **253.7 tok/s** | **259.1 tok/s** | 31.7 tok/s |
 | 16 | 512 | 21.8 s | 375.5 tok/s | 432.5 tok/s | 23.5 tok/s |
 | 32 | 512 | 32.4 s | 506.0 tok/s | 644.3 tok/s | 15.8 tok/s |
 
-The last two rows are the same server and the same concurrency; only the
-output length differs. With 512-token outputs the run is too short for the
-pipeline to fill, so aggregate and steady disagree by a third. With
-2048-token outputs they converge to within 2 percent. Any comparison that
-puts one system's steady dashboard reading next to another system's
-short-run aggregate is measuring output length, not the engine.
+The two 8-stream rows differ only in output length. With 512-token outputs the
+run is too short for the PP4 pipeline to fill, so aggregate understates the
+steady rate; with 2048-token outputs the two converge to within 2 percent. Any
+comparison that puts one system's steady dashboard reading next to another
+system's short-run aggregate is measuring output length, not the engine.
 
 The engine's own plateau lines for the 2048-token run, for reference:
 
