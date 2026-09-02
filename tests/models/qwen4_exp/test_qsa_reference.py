@@ -658,10 +658,6 @@ def test_qsa_decode_selection_correctness(
     torch.testing.assert_close(actual.sort().values, expected.sort().values)
 
 
-def _max_seq_len(sequence_lengths) -> int:
-    return max(int(s) for s in sequence_lengths)
-
-
 @requires_qsa_kernels
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
@@ -714,7 +710,7 @@ def test_qsa_prefill_selection_correctness(
         compress_ratio,
         max(query_lens),
         actual,
-        max_seq_len=_max_seq_len(sequence_lengths) + seq_len_slack,
+        max_seq_len=sequence_lengths.max().item() + seq_len_slack,
     )
     expected = _qsa_select_paged_reference(
         q,
@@ -965,7 +961,7 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
         compress_ratio,
         query_lens[-1],
         block_indices[prefill_slice],
-        max_seq_len=_max_seq_len(sequence_lengths),
+        max_seq_len=sequence_lengths.max().item(),
     )
     # +1: the packed trailing count column (never a token index; excluded
     # from the comparison).
