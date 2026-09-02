@@ -21,6 +21,8 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 
@@ -246,6 +248,218 @@ def _synchronize_device(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
+def _find_qsa_indexer(runner: "GPUModelRunner"):
+    model = getattr(runner, "model", None)
+    if model is None:
+        return None
+    for module in model.modules():
+        if all(
+            hasattr(module, attr)
+            for attr in (
+                "index_n_heads",
+                "index_head_dim",
+                "compress_ratio",
+                "token_topk",
+                "raw_key_cache",
+                "compressed_key_cache",
+                "rotary_emb",
+                "q_layernorm",
+                "k_layernorm",
+            )
+        ):
+            return module
+    return None
+
+
+def _warm_qsa_kernels(
+    runner: "GPUModelRunner",
+    model_config: object,
+    device: torch.device,
+    static_forward_context: object,
+) -> None:
+    """Pre-compile the four QSA Triton kernels on the shapes the scheduler
+    produces, so none of them JIT inside a pipeline-parallel collective.
+
+    The warmup ladder (vllm/v1/worker/gpu/warmup.py) runs prefill with a
+    prompt a few tokens long, so it never reaches the large-shape
+    specializations these kernels pick at real batch and chunk sizes. This
+    walks the shapes directly instead, reusing the layer's already-bound
+    cache tensors for exact page sizes and strides.
+    """
+    indexer = _find_qsa_indexer(runner)
+    if indexer is None:
+        logger.info("Skipping QSA Triton warmup: no QSA indexer layer found.")
+        return
+
+    n_heads = int(indexer.index_n_heads)
+    head_dim = int(indexer.index_head_dim)
+    compress_ratio = int(indexer.compress_ratio)
+    token_topk = int(indexer.token_topk)
+    output_width = token_topk + compress_ratio - 1
+
+    raw_cache = indexer.raw_key_cache.kv_cache
+    comp_cache = indexer.compressed_key_cache.kv_cache
+    max_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    # The block table row length is cdiv(max_len, cache block_size) -- the
+    # scheduler's storage block size, NOT the compressed cache's state count
+    # (comp_cache.shape[1] is the per-block state count, 14336 here, which
+    # would shrink the table to 70 rows and compile the wrong specialization).
+    cache_block_size = int(getattr(runner.cache_config, "block_size", 0) or 0)
+    page_table_width = (
+        (max_len + cache_block_size - 1) // cache_block_size
+        if max_len and cache_block_size else 0
+    )
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    num_q_heads = int(getattr(hf_text_config, "num_attention_heads", 0) or 0)
+    num_kv_heads = int(getattr(hf_text_config, "num_key_value_heads", 0) or 0)
+    main_head_dim = int(getattr(hf_text_config, "head_dim", 0) or 0)
+    logger.info(
+        "QSA warmup config: indexer heads=%d head_dim=%d ratio=%d topk=%d "
+        "page_table_width=%d cache_block_size=%d main(q=%d,kv=%d,hd=%d).",
+        n_heads, head_dim, compress_ratio, token_topk, page_table_width,
+        cache_block_size, num_q_heads, num_kv_heads, main_head_dim,
+    )
+    num_reqs = 1
+    bf16 = torch.bfloat16
+
+    # Kernels 2+3: _qsa_mqa_paged_kernel and _expand_qsa_indices_kernel.
+    # rows <= 32 and rows > 32 select different TILES_PER_PROG specializations.
+    # columns = page_table_width * page_size (~8M here) would push the launch
+    # grid past CUDA's 65535 Y limit at rows <= 32. columns is a runtime arg,
+    # not a constexpr, so clamping it via num_columns keeps the grid legal
+    # without changing the compiled specialization.
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        expand_qsa_block_indices_cuda,
+        qsa_mqa_paged,
+        qsa_sparse_paged_attention,
+    )
+
+    block_topk = token_topk // compress_ratio
+    for rows in (1, 33):
+        q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
+        page_table = torch.zeros(
+            (num_reqs, page_table_width), dtype=torch.int32, device=device
+        )
+        token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+        # query_positions is logical_positions on the real path, int64.
+        query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        qsa_mqa_paged(
+            q,
+            comp_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            num_columns=4096,
+        )
+        block_indices = torch.zeros(
+            (rows, block_topk), dtype=torch.int32, device=device
+        )
+        out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
+        expand_qsa_block_indices_cuda(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
+
+    # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
+    # are picked from base_programs = rows * num_kv_heads, so walk every
+    # bucket boundary.
+    if num_q_heads and num_kv_heads and main_head_dim and page_table_width:
+        k_cache = torch.empty(
+            (16, cache_block_size, num_kv_heads, main_head_dim), dtype=bf16, device=device
+        )
+        v_cache = torch.empty_like(k_cache)
+        for rows in (1, 2, 8, 16, 128, 256, 300):
+            q = torch.empty(
+                (rows, num_q_heads, main_head_dim), dtype=bf16, device=device
+            )
+            logical_indices = torch.zeros(
+                (rows, output_width), dtype=torch.int32, device=device
+            )
+            block_table = torch.zeros(
+                (num_reqs, page_table_width), dtype=torch.int32, device=device
+            )
+            token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+            qsa_sparse_paged_attention(
+                q, k_cache, v_cache, logical_indices, block_table, token_to_req
+            )
+
+    # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on
+    # num_tokens <= 4096, so warm both sides. num_k_work = 0 compiles the whole
+    # kernel (both the K-compress and Q-normalize branches) while executing only
+    # the Q branch, so no compressor metadata needs to be built here.
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import qsa_pre_indexer
+
+    mrope_section = getattr(indexer.rotary_emb, "mrope_section", None)
+    rope_pos_offset = (
+        indexer.raw_key_cache.rope_position_offset
+        if indexer.raw_key_cache.rope_position_cache is not None
+        else None
+    )
+    cos_sin_cache = indexer.rotary_emb.cos_sin_cache
+    q_norm_weight = indexer.q_layernorm.weight
+    k_norm_weight = indexer.k_layernorm.weight
+    eps = float(indexer.q_layernorm.variance_epsilon)
+    for num_tokens in (1, 5000):
+        q = torch.empty(
+            (num_tokens, n_heads * head_dim), dtype=bf16, device=device
+        )
+        k = torch.empty((num_tokens, head_dim), dtype=bf16, device=device)
+        if mrope_section is not None:
+            positions = torch.zeros(
+                (3, num_tokens), dtype=torch.int64, device=device
+            )
+        else:
+            positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        q_out = torch.empty(
+            (num_tokens, n_heads, head_dim), dtype=bf16, device=device
+        )
+        state_slots = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        state_block_table = torch.zeros(
+            (num_reqs, 1), dtype=torch.int32, device=device
+        )
+        query_start_loc = torch.zeros(
+            num_reqs + 1, dtype=torch.int32, device=device
+        )
+        logical_positions = torch.zeros(
+            num_tokens, dtype=torch.int64, device=device
+        )
+        compressed_slots = torch.zeros(
+            num_tokens, dtype=torch.int64, device=device
+        )
+        k_work_metadata = torch.empty((0, 2), dtype=torch.int32, device=device)
+        qsa_pre_indexer(
+            q,
+            k,
+            positions,
+            cos_sin_cache,
+            q_norm_weight,
+            k_norm_weight,
+            eps,
+            q_out,
+            raw_cache,
+            state_slots,
+            state_block_table,
+            query_start_loc,
+            logical_positions,
+            comp_cache,
+            compressed_slots,
+            k_work_metadata,
+            compress_ratio=compress_ratio,
+            mrope_section=mrope_section,
+            rope_pos_offset=rope_pos_offset,
+        )
+    torch.accelerator.synchronize(device)
+
+
 @torch.inference_mode()
 def qwen_triton_warmup(
     runner: "GPUModelRunner",
@@ -272,10 +486,16 @@ def qwen_triton_warmup(
     compilation_config = getattr(runner, "compilation_config", None)
     static_forward_context = getattr(compilation_config, "static_forward_context", None)
     gdn_config = _qwen_gdn_warmup_config(static_forward_context)
-    if gdn_config is None:
-        return
-
-    _warm_causal_conv1d_fwd_kernel(device, gdn_config)
-    _warm_fused_post_conv_kernel(device, gdn_config)
-    _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+    try:
+        if gdn_config is not None:
+            _warm_causal_conv1d_fwd_kernel(device, gdn_config)
+            _warm_fused_post_conv_kernel(device, gdn_config)
+            _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+        _warm_qsa_kernels(runner, model_config, device, static_forward_context)
+    except Exception:
+        logger.warning(
+            "Qwen Triton warmup did not complete; some kernels may JIT on the "
+            "first request.",
+            exc_info=True,
+        )
     _synchronize_device(device)

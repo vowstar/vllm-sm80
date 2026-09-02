@@ -624,6 +624,54 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+
+    # Triton specializes a kernel on whether each pointer argument is 16-byte
+    # aligned, so an unaligned tensor is a different compiled kernel. The small
+    # per-step tensors below are adjacent slices of one buffer, which makes the
+    # alignment pattern depend on the batch size: num_sampled can land aligned
+    # while num_rejected, right behind it, does not. Combined with a batch size
+    # the scheduler picks freely, the set of specializations is unbounded and no
+    # amount of warmup can cover it.
+    #
+    # That matters here because this kernel runs inside update_pp_decode_requests
+    # on a pipeline-parallel deployment, between two NCCL transfers. A rank that
+    # compiles there stalls while its peers wait in the collective, and the
+    # server stops rather than slows. Upstream reports the same shape in
+    # vllm-project/vllm#45198.
+    #
+    # Copying an unaligned tensor into a fresh allocation removes the dimension.
+    # A new allocation is always aligned, so only the aligned specialization is
+    # ever launched. The tensors are one element per request, so at 32 requests
+    # this copies 128 bytes.
+    def _aligned(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None or t.data_ptr() % 16 == 0:
+            return t
+        return t.clone()
+
+    idx_mapping = _aligned(idx_mapping)
+    sampled_tokens = _aligned(sampled_tokens)
+    num_sampled = _aligned(num_sampled)
+    num_rejected = _aligned(num_rejected)
+    query_start_loc = _aligned(query_start_loc)
+
+    import os as _os
+    if _os.getenv("VLLM_POST_UPDATE_SIG_DEBUG"):
+        def _d(x):
+            if x is None:
+                return "None"
+            return f"{x.dtype}|align16={(x.data_ptr() % 16) == 0}"
+        print(
+            "POST_UPDATE_SIG n=%d idx=%s ncomp=%s last=%s bins=%s samp=%s|s0=%s "
+            "nsamp=%s nrej=%s qsl=%s allids=%s|s0=%s total=%s"
+            % (
+                num_reqs, _d(idx_mapping), _d(num_computed_tokens),
+                _d(last_sampled_tokens), _d(output_bin_counts), _d(sampled_tokens),
+                sampled_tokens.stride(0), _d(num_sampled), _d(num_rejected),
+                _d(query_start_loc), _d(all_token_ids), all_token_ids.stride(0),
+                _d(total_len),
+            ),
+            flush=True,
+        )
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
