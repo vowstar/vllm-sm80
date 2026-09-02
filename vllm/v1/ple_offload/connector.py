@@ -96,13 +96,24 @@ class PleOffloadConnector:
         self._validate_input_sources()
 
         self._pinned_input_buffers: list[torch.Tensor] = []
-        # PLE rejects DBO, and each forward consumes its output before the
-        # next launch, so one pending request is sufficient. Pipeline
-        # parallelism runs the engine batch queue, which can start the next
-        # forward before the staging thread has drained the previous request,
-        # so the producer waits instead of failing.
+        # PLE rejects DBO, and with pipeline_parallel_size=1 each forward
+        # consumes its output before the next launch, so one pending request
+        # is enough there. Under pipeline parallelism the engine batch queue
+        # keeps several forwards in flight at once, and a depth-1 queue then
+        # makes the producer block on almost every step. Blocking alone is not
+        # a fix: it only defers the failure to the PLE_LAUNCH_QUEUE_TIMEOUT_S
+        # bound. Measured on PP4 with max-num-seqs 16, a 16-way load killed the
+        # engine after 60 s with queue.Full raised from _launch, so rank 0 --
+        # the only rank that holds the PLE embedding -- took the whole service
+        # down. Size the queue for the real in-flight depth instead.
+        queue_depth = int(
+            os.getenv(
+                "VLLM_PLE_LAUNCH_QUEUE_DEPTH",
+                str(max(2, 2 * vllm_config.parallel_config.pipeline_parallel_size)),
+            )
+        )
         self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
-            maxsize=1
+            maxsize=queue_depth
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
