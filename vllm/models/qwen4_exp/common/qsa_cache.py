@@ -583,9 +583,13 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             # new name during the merge and this call site was not.
             assert isinstance(kv_cache_spec.tokens_per_state, int)
             self.compress_ratio = kv_cache_spec.tokens_per_state
+            # tokens_per_state compresses block_size tokens into num_states
+            # stored rows; the compressed cache holds one row per complete
+            # group, so its block spans num_states (not block_size) slots.
+            self.storage_block_size = kv_cache_spec.num_states
         else:
             self.compress_ratio = 1
-        self.storage_block_size = kv_cache_spec.storage_block_size
+            self.storage_block_size = kv_cache_spec.storage_block_size
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -762,6 +766,11 @@ class QSAKeyStateCache(_QSAStateCache):
         super().__init__(head_size=storage_head_size, **kwargs)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # The generic cache-layout planner delivers ``[B, H, N, C]``; the QSA
+        # kernels index ``[B, N, 1, C]``. H is always 1 here, so a dim swap
+        # restores the packed row-major view without a copy.
+        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
+            kv_cache = kv_cache.permute(0, 2, 1, 3)
         if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
             raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
         if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
@@ -798,6 +807,13 @@ class QSAKeyStateCache(_QSAStateCache):
 class QSACompressedKeyCache(_QSAStateCache):
     """Normalized, group-first-RoPE BF16 key at one row per complete group."""
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # Same [B, H, N, C] -> [B, N, 1, C] adaptation as the raw cache: the
+        # kernels address the compressed cache as a packed row-major page.
+        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
+            kv_cache = kv_cache.permute(0, 2, 1, 3)
+        super().bind_kv_cache(kv_cache)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
         return MLAAttentionSpec(
@@ -806,6 +822,7 @@ class QSACompressedKeyCache(_QSAStateCache):
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
+            disable_kernel_block_splitting=True,
         )
 
 

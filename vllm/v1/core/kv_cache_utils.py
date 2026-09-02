@@ -2324,6 +2324,12 @@ def _max_memory_usage_bytes_from_groups(
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
     total_blocks = 0
     for group in kv_cache_groups:
+        # PP projection keeps a group entry per global group even when this
+        # worker owns none of its layers; those empty entries must not claim
+        # blocks here (their layer count is already reflected in the other
+        # workers' projections).
+        if not group.layer_names:
+            continue
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             total_blocks += spec.max_memory_usage_pages(vllm_config)

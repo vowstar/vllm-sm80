@@ -293,6 +293,7 @@ class AttentionGroup:
         elif (
             isinstance(self.kv_cache_spec, AttentionSpec)
             and self.kv_cache_spec.tokens_per_state > 1
+            and not self.kv_cache_spec.disable_kernel_block_splitting
         ):
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
                 compressed_kernel_block_size(self.kv_cache_spec)
@@ -459,7 +460,11 @@ def allocate_kv_cache(
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
-        if isinstance(spec, AttentionSpec) and spec.tokens_per_state > 1:
+        if (
+            isinstance(spec, AttentionSpec)
+            and spec.tokens_per_state > 1
+            and not spec.disable_kernel_block_splitting
+        ):
             kernel_block_size = compressed_kernel_block_size(spec)
 
         views = create_kv_cache_views(

@@ -384,6 +384,9 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    disable_kernel_block_splitting: bool = False
+    """Opt out of the ``compressed_kernel_block_size`` page tiling for specs
+    whose kernels address one manager block as one page (e.g. Qwen4Exp QSA)."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -583,6 +586,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             non_causal_multi_token_decode=non_causal_mtd_set.pop(),
+            disable_kernel_block_splitting=specs[0].disable_kernel_block_splitting,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
