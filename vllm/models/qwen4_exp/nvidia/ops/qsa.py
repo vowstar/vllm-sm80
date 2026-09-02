@@ -15,7 +15,9 @@ _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_rows", "num_columns", "num_pages", "num_requests"]
+)
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -189,7 +191,7 @@ def _expand_qsa_indices_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_cache_blocks", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -358,7 +360,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
