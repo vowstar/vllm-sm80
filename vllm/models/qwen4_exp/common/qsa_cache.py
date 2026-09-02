@@ -792,6 +792,24 @@ class QSACompressedKeyCache(_QSAStateCache):
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
+            # REINSTATED after the first migrated boot failed on all four PP
+            # ranks with:
+            #   ValueError: The resolved KV cache layout (BLNHC) does not store
+            #   blocks as dense, unpadded pages (block stride 11010048 != page
+            #   3670016), so a manager block cannot be split into 224 kernel
+            #   blocks of 256 tokens.
+            # f3acdd7f8 dropped this line on the theory that declaring
+            # get_supported_kernel_block_sizes() = MultipleOf(16) made it
+            # redundant. It does not: declaring which block sizes a kernel can
+            # consume cannot make a non-dense layout splittable, and the two
+            # solve different halves of the problem. The launcher already runs
+            # --block-size 256, the first remedy the error itself suggests, so
+            # that route is exhausted. The other remedy, VLLM_KV_CACHE_LAYOUT=
+            # LBNHC, would change the layout for every cache in the process and
+            # so would reach GLM and DeepSeek too; this flag reaches only the
+            # QSA compressed spec. Upstream never hits this because it does not
+            # run this model at this block size on this layout.
+            disable_kernel_block_splitting=True,
         )
 
 
