@@ -131,13 +131,56 @@ recurrent state instead of a growing cache, and because its launcher pins
 ### Throughput against concurrency
 
 The three models run different topologies (DeepSeek PP4 and PP5, Qwen PP4,
-GLM PP5) and different true-concurrency caps (`--max-num-seqs`): DeepSeek 128,
-GLM 32, Qwen 32. Qwen's production launcher had pinned 8 to keep single-stream
-latency high, but that is a choice, not a limit: raised to 32, Qwen PP4 runs
-32 concurrent streams at 804.8 tok/s aggregate (26.5 tok/s per-stream median)
-on the 440 GiB-RAM server with no crash. A shared throughput table is not
-published because the three models' different topologies and caps make one
-"streams" count mean different things per model.
+GLM PP5) and different true-concurrency caps (`--max-num-seqs`). A shared
+throughput table is not published because those differences make one "streams"
+count mean different things per model.
+
+**Two throughput numbers exist and they are not interchangeable.** Quoting one
+against the other is the most common way these figures get misread:
+
+- **aggregate** is total output tokens divided by total wall clock. Time to
+  first token, the pipeline fill and the drain at the end are all charged
+  against it. It is the honest end-to-end number for a fixed batch of work.
+- **steady generation** is the engine's own `Avg generation throughput` while
+  the requested concurrency is actually resident. It is what a serving
+  dashboard displays, and it excludes everything before the plateau.
+
+On a four-stage pipeline the gap between them is large and shrinks as the run
+gets longer, because a PP4 pipeline cannot reach steady state until enough
+requests are in flight. Measured on Qwen PP4, 5x CMP 170HX, prose prompts of
+about 1,765 tokens with unique prefixes so the prefix cache never hits:
+
+| Concurrency | Output/req | Wall | aggregate | steady generation | per-request median |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 512 | 22.6 s | 22.7 tok/s | 38.9 tok/s | 22.7 tok/s |
+| 4 | 512 | 25.3 s | 80.9 tok/s | 49.4 tok/s | 20.2 tok/s |
+| 8 | 512 | 19.7 s | 207.7 tok/s | 158.8 tok/s | 26.0 tok/s |
+| 8 | 2048 | 64.6 s | **253.7 tok/s** | **259.1 tok/s** | 31.7 tok/s |
+
+The last two rows are the same server and the same concurrency; only the
+output length differs. With 512-token outputs the run is too short for the
+pipeline to fill, so aggregate and steady disagree by a third. With
+2048-token outputs they converge to within 2 percent. Any comparison that
+puts one system's steady dashboard reading next to another system's
+short-run aggregate is measuring output length, not the engine.
+
+The engine's own plateau lines for the 2048-token run, for reference:
+
+```
+Avg generation throughput: 257.0 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
+Avg generation throughput: 265.7 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
+Avg generation throughput: 261.3 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
+Avg generation throughput: 265.9 tokens/s, Running: 8 reqs, Prefix cache hit rate: 0.0%
+```
+
+**Concurrency above 8 is not yet usable for Qwen on this fork.**
+`--max-num-seqs 16` starts and serves single requests but the engine dies
+under a 16-way load with `RPC call to sample_tokens timed out`.
+`--max-num-seqs 32` does not finish starting at all: it stalls inside the
+pipeline-parallel warmup collective. Both trace to the same cause, described
+under Known limits below. An earlier revision of this file claimed 32 streams
+at 804.8 tok/s aggregate; that claim did not survive re-measurement and has
+been removed.
 
 An earlier build killed the Qwen engine at 32 streams. The PLE offload request
 queue held one entry and the producer used `put_nowait`, which assumes each
@@ -183,7 +226,9 @@ this fork's work.
 | PP4 serving | Works |
 | 1,000,000 token YaRN context | Works, from a native 262,144 |
 | PLE CPU offload under PP | Works |
-| 32 concurrent streams | Works after the staging queue fix |
+| 8 concurrent streams | Works, 259 tok/s steady generation, cold prefix cache |
+| 16 concurrent streams | Starts, but the engine dies under load |
+| 32 concurrent streams | Does not finish starting |
 | Prefix caching | Works |
 | Vision tower | Loads and warms up, image accuracy not checked |
 | MTP | Not available under PP |
