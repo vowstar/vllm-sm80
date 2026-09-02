@@ -1028,13 +1028,20 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
     """
-    num_blocks_per_request = sum(
-        cdiv(
+    num_blocks_per_request = 0
+    for group in kv_cache_config.kv_cache_groups:
+        # PP projection keeps a group entry per global group even when this
+        # worker owns none of its layers; those empty entries must not claim
+        # blocks here (their layer count is already reflected in the other
+        # workers' projections). Without this, the reported token capacity
+        # divides by a per-request block count that includes every remote
+        # stage's layers, under-reporting capacity by the PP factor.
+        if not group.layer_names:
+            continue
+        num_blocks_per_request += cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
-        for group in kv_cache_config.kv_cache_groups
-    )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
