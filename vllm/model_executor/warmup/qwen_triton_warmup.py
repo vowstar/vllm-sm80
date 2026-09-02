@@ -271,6 +271,22 @@ def _find_qsa_indexer(runner: "GPUModelRunner"):
     return None
 
 
+def _find_qsa_attention(runner: "GPUModelRunner"):
+    model = getattr(runner, "model", None)
+    if model is None:
+        return None
+    for module in model.modules():
+        if (
+            hasattr(module, "indexer")
+            and hasattr(module, "kv_cache")
+            and hasattr(module, "topk_indices_buffer")
+            and hasattr(module, "head_dim")
+            and hasattr(module, "num_kv_heads")
+        ):
+            return module
+    return None
+
+
 def _warm_qsa_kernels(
     runner: "GPUModelRunner",
     model_config: object,
@@ -336,6 +352,11 @@ def _warm_qsa_kernels(
     )
 
     block_topk = token_topk // compress_ratio
+    logger.info(
+        "QSA mqa warmup: comp_cache %s dtype=%s; page_table w=%d; "
+        "token_to_req/query_positions/seq_lens = int32/int64/int32.",
+        tuple(comp_cache.shape), comp_cache.dtype, page_table_width,
+    )
     for rows in (1, 33):
         q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
         page_table = torch.zeros(
@@ -371,15 +392,25 @@ def _warm_qsa_kernels(
 
     # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
     # are picked from base_programs = rows * num_kv_heads, so walk every
-    # bucket boundary.
-    if num_q_heads and num_kv_heads and main_head_dim and page_table_width:
-        k_cache = torch.empty(
-            (16, cache_block_size, num_kv_heads, main_head_dim), dtype=bf16, device=device
+    # bucket boundary. Reuse the live attention cache (transposed and split
+    # exactly as forward_qsa does) so PAGE_SIZE and the K/V interleaved stride
+    # match the real path instead of a guessed torch.empty.
+    attention = _find_qsa_attention(runner)
+    if (
+        attention is not None
+        and num_q_heads and num_kv_heads and main_head_dim and page_table_width
+    ):
+        attn_head_dim = int(attention.head_dim)
+        key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
+            attn_head_dim, dim=-1
         )
-        v_cache = torch.empty_like(k_cache)
+        logger.info(
+            "QSA splitk warmup: live cache %s -> key_cache %s.",
+            tuple(attention.kv_cache.shape), tuple(key_cache.shape),
+        )
         for rows in (1, 2, 8, 16, 128, 256, 300):
             q = torch.empty(
-                (rows, num_q_heads, main_head_dim), dtype=bf16, device=device
+                (rows, num_q_heads, attn_head_dim), dtype=bf16, device=device
             )
             logical_indices = torch.zeros(
                 (rows, output_width), dtype=torch.int32, device=device
@@ -389,7 +420,7 @@ def _warm_qsa_kernels(
             )
             token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
             qsa_sparse_paged_attention(
-                q, k_cache, v_cache, logical_indices, block_table, token_to_req
+                q, key_cache, value_cache, logical_indices, block_table, token_to_req
             )
 
     # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on

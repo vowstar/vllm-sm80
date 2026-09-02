@@ -225,10 +225,12 @@ def warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
-    # Use decode_query_len + 1 tokens so the prefill batch's per-request query
-    # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    # A realistic-length prefill (4096 tokens) so prefill-only kernels that
+    # specialize on large shapes -- Qwen4 QSA's indexer and sparse attention,
+    # which the AOT/torch.compile path compiles separately from a direct
+    # Triton JIT call -- warm before serving. It still exceeds decode_query_len
+    # so the batch is not misclassified as uniform decode.
+    prompt_len = max(decode_query_len + 1, 4096)
     prompt_token_ids = list(range(prompt_len))
     # Intermediate decode batch sizes to warm, on top of the 1 / 2 / num_reqs
     # that `decode_steps` below already covers.
