@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
+    KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
 )
@@ -578,18 +579,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
-            # Upstream renamed MLAAttentionSpec.compress_ratio to
-            # tokens_per_state; the DeepSeek indexer builder was adapted to the
-            # new name during the merge and this call site was not.
-            assert isinstance(kv_cache_spec.tokens_per_state, int)
-            self.compress_ratio = kv_cache_spec.tokens_per_state
-            # tokens_per_state compresses block_size tokens into num_states
-            # stored rows; the compressed cache holds one row per complete
-            # group, so its block spans num_states (not block_size) slots.
-            self.storage_block_size = kv_cache_spec.num_states
+            compress_ratio = kv_cache_spec.tokens_per_state
+            assert isinstance(compress_ratio, int), (
+                "QSA compression requires an integer tokens_per_state"
+            )
+            self.compress_ratio = compress_ratio
         else:
             self.compress_ratio = 1
-            self.storage_block_size = kv_cache_spec.storage_block_size
+        self.storage_block_size = kv_cache_spec.num_states
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -679,30 +676,10 @@ class QSAStateBackend(AttentionBackend):
     def get_builder_cls() -> type[QSAMetadataBuilder]:
         return QSAMetadataBuilder
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        del cache_dtype_str
-        if num_kv_heads != 1:
-            raise ValueError("QSA side caches require exactly one KV head")
-        return (num_blocks, block_size, num_kv_heads, head_size)
-
     @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        return True
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            return (0, 1, 2, 3, 4)
-        return (0, 1, 2, 3)
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # QSA pages are packed beside the main KV pages within each block.
+        return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -741,6 +718,14 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
 
     def forward(self) -> None: ...
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Adapt the unified [B, H, N, C] view to QSA's [B, N, H, C]."""
+        if kv_cache.ndim != 4 or kv_cache.shape[1] != 1:
+            raise ValueError("QSA state cache must be [blocks, 1, states, width]")
+        if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
+            raise ValueError("QSA state cache does not match its packed BF16 spec")
+        super().bind_kv_cache(kv_cache.transpose(1, 2))
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return QSAStateBackend
 
@@ -766,19 +751,11 @@ class QSAKeyStateCache(_QSAStateCache):
         super().__init__(head_size=storage_head_size, **kwargs)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # The generic cache-layout planner delivers ``[B, H, N, C]``; the QSA
-        # kernels index ``[B, N, 1, C]``. H is always 1 here, so a dim swap
-        # restores the packed row-major view without a copy.
-        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
-            kv_cache = kv_cache.permute(0, 2, 1, 3)
-        if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
-            raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
-        if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
-            raise ValueError("QSA raw cache does not match its packed BF16 cache spec")
         super().bind_kv_cache(kv_cache)
-        self.key_cache = kv_cache[..., : self.key_head_size]
+        qsa_cache = self.kv_cache
+        self.key_cache = qsa_cache[..., : self.key_head_size]
         if self.cache_rope_positions:
-            position_tail = kv_cache[..., self.rope_position_offset :]
+            position_tail = qsa_cache[..., self.rope_position_offset :]
             self.rope_position_cache = position_tail.view(torch.int64)
         else:
             self.rope_position_cache = None
@@ -807,13 +784,6 @@ class QSAKeyStateCache(_QSAStateCache):
 class QSACompressedKeyCache(_QSAStateCache):
     """Normalized, group-first-RoPE BF16 key at one row per complete group."""
 
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # Same [B, H, N, C] -> [B, N, 1, C] adaptation as the raw cache: the
-        # kernels address the compressed cache as a packed row-major page.
-        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
-            kv_cache = kv_cache.permute(0, 2, 1, 3)
-        super().bind_kv_cache(kv_cache)
-
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
         return MLAAttentionSpec(
@@ -822,7 +792,6 @@ class QSACompressedKeyCache(_QSAStateCache):
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
-            disable_kernel_block_splitting=True,
         )
 
 
