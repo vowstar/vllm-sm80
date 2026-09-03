@@ -146,26 +146,20 @@ COMPRESS_RATIO = 4
 
 
 def _run_sparse(q, k_cache, v_cache, indices, block_table, token_to_req, **kwargs):
-    """Call the kernel wrapper with metadata that keeps the whole selection
-    inside the kernel's in-kernel valid extent (positions at SEQ_LEN - 1 give
-    a valid_count of block_topk * COMPRESS_RATIO, past every valid column)."""
+    """Call the kernel wrapper with a packed selection buffer: the trailing
+    column holds the row's valid-entry count, and a full count keeps the
+    whole selection inside the kernel's tile-loop bound."""
     rows = q.shape[0]
-    logical_positions = torch.full(
-        (rows,), SEQ_LEN - 1, dtype=torch.int64, device=q.device
-    )
-    seq_lens = torch.full(
-        (block_table.shape[0],), SEQ_LEN, dtype=torch.int32, device=q.device
-    )
+    packed = torch.empty((rows, TOPK + 1), dtype=torch.int32, device=q.device)
+    packed[:, :TOPK] = indices
+    packed[:, TOPK] = TOPK
     return qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
-        indices,
+        packed,
         block_table,
         token_to_req,
-        logical_positions,
-        seq_lens,
-        COMPRESS_RATIO,
         False,
         **kwargs,
     )

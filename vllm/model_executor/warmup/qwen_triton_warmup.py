@@ -352,15 +352,16 @@ def _warm_qsa_kernels(
     bf16 = torch.bfloat16
 
     # Kernels 2+3: the QSA indexer prefill scoring kernel and
-    # _expand_qsa_indices_kernel. The uniform decode scoring kernel is warmed
-    # separately by qwen4_exp_qsa_triton_warmup across every reachable
-    # decode-query-length specialization.
+    # _expand_qsa_indices_kernel, reached through their public select/expand
+    # wrappers. The uniform decode scoring kernel is warmed separately by
+    # qwen4_exp_qsa_triton_warmup across every reachable decode-query-length
+    # specialization.
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
         qsa_sparse_paged_attention,
     )
     from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
-        expand_qsa_block_indices_cuda,
-        qsa_mqa_paged_prefill,
+        expand_qsa_block_indices,
+        qsa_select_paged_prefill,
     )
 
     block_topk = token_topk // compress_ratio
@@ -373,28 +374,34 @@ def _warm_qsa_kernels(
         page_table = torch.zeros(
             (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
         )
-        token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
         # query_positions is logical_positions on the real path, int64.
         query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
-        sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
-        qsa_mqa_paged_prefill(
-            q,
-            comp_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            compress_ratio,
+        # All query rows in the first request; offsets are non-decreasing.
+        query_start_loc = torch.zeros(
+            num_reqs + 1, dtype=torch.int32, device=device
         )
+        query_start_loc[1:] = rows
+        visible_blocks = torch.zeros(rows, dtype=torch.int32, device=device)
         block_indices = torch.zeros(
             (rows, block_topk), dtype=torch.int32, device=device
         )
-        out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
-        expand_qsa_block_indices_cuda(
+        qsa_select_paged_prefill(
+            q,
+            comp_cache,
+            page_table,
+            query_start_loc,
+            visible_blocks,
+            token_topk,
+            compress_ratio,
+            rows,
+            block_indices,
+        )
+        # +1: the packed buffer's trailing valid-count column.
+        out = torch.zeros((rows, output_width + 1), dtype=torch.int32, device=device)
+        expand_qsa_block_indices(
             block_indices,
             query_positions,
-            sequence_lengths,
-            token_to_req,
+            visible_blocks,
             compress_ratio,
             token_topk,
             out,
@@ -434,16 +441,16 @@ def _warm_qsa_kernels(
                 q = torch.empty(
                     (rows, num_q_heads, attn_head_dim), dtype=bf16, device=device
                 )
+                # Packed selection buffer: trailing column holds the row's
+                # valid-entry count; a full count covers every tile.
                 logical_indices = torch.zeros(
-                    (rows, output_width), dtype=torch.int32, device=device
+                    (rows, output_width + 1), dtype=torch.int32, device=device
                 )
+                logical_indices[:, -1] = output_width
                 block_table = torch.zeros(
                     (num_reqs, main_page_table_width), dtype=torch.int32, device=device
                 )
                 token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-                # Same dtypes as the QSA side-cache metadata on the real path.
-                logical_positions = torch.zeros(rows, dtype=torch.int64, device=device)
-                seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
                 # is_prefill only steers the top config-table region; warm both
                 # sides once the batch can reach it.
                 prefill_flags = (
@@ -457,9 +464,6 @@ def _warm_qsa_kernels(
                         logical_indices,
                         block_table,
                         token_to_req,
-                        logical_positions,
-                        seq_lens,
-                        compress_ratio,
                         is_prefill,
                         k_scale=getattr(attention, "_k_scale", None),
                         v_scale=getattr(attention, "_v_scale", None),
