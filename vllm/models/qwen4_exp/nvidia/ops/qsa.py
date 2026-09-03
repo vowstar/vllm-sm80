@@ -585,13 +585,20 @@ def _compress_qsa_groups_kernel(
     )
 
 
-def _splitk_config(base_programs: int, long_query: bool) -> tuple[int, int, int]:
+def _splitk_config(base_programs: int, is_prefill: bool) -> tuple[int, int, int]:
     """Return (BLOCK_N, target_splits, num_warps) for the split-K kernel.
 
-    Tuned on GB300 for the Qwen3.8-Flash-Next TP1, TP2, and TP4 shapes
+    Tuned on GB300 for the Qwen3.8-Flash-Next TP1, TP2, and TP4 shapes.
+    Past the decode table (bp > 2048) the prefill profile uses narrow
+    no-split tiles: prefill/mixed batches have causally ragged per-row work
+    (each row's valid extent ramps with its position), while decode/verify
+    batches are uniform-extent (every row at full budget) and keep the wide
+    entry. Measured: no single config serves both distributions within ~3%.
+    is_prefill is capture-stable: at FULL-graph capture max_query_len is the
+    uniform decode/verify length by construction, identical at replay.
     """
     if base_programs > 2048:
-        return (32, 1, 1) if long_query else (64, 1, 2)
+        return (32, 1, 1) if is_prefill else (64, 1, 2)
     if base_programs <= 24:
         return 32, 64, 4
     if base_programs <= 64:
@@ -615,8 +622,7 @@ def qsa_sparse_paged_attention(
     logical_positions: torch.Tensor,
     seq_lens: torch.Tensor,
     compress_ratio: int,
-    max_query_len: int,
-    max_decode_query_len: int,
+    is_prefill: bool,
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
@@ -641,19 +647,7 @@ def qsa_sparse_paged_attention(
     the strided split walk smooths wave quantization and is locality-neutral
     because selections are score-rank-ordered, not position-ordered.
 
-    Args:
-        logical_positions: int64 [rows] per-row logical (request-relative)
-            query positions from the QSA side-cache metadata.
-        seq_lens: int32 [num_requests] per-request sequence lengths from the
-            same metadata.
-        compress_ratio: Indexer compress ratio.
-        max_query_len: Host-side max query tokens per request in this batch.
-        max_decode_query_len: Decode/verify query length, 1 + num_spec. The
-            pair only steers the top of the config table (bp > 2048); it is
-            capture-stable because at FULL-graph capture max_query_len is the
-            uniform decode/verify length by construction — identical at
-            replay. (max_seq_len is NOT capture-stable — it is max_model_len
-            at capture — which is why no rule may key on it.)
+    is_prefill only steers the top of the config table; see _splitk_config.
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -728,9 +722,7 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
-    block_n, target_splits, partial_warps = _splitk_config(
-        base_programs, max_query_len > max_decode_query_len
-    )
+    block_n, target_splits, partial_warps = _splitk_config(base_programs, is_prefill)
 
     # Quantized caches need shared memory for the dequantized bf16 tiles next
     # to the raw tiles. On SM120 the fp8 branch with BLOCK_N=64 and two
@@ -884,9 +876,9 @@ def warmup_qsa_sparse_paged_attention(
 
     # Every config the dispatch can pick for this group size.
     profiles = {
-        _splitk_config(base_programs, long_query)
+        _splitk_config(base_programs, is_prefill)
         for base_programs in range(1, 8193)
-        for long_query in (False, True)
+        for is_prefill in (False, True)
     }
 
     # Scalars constant per deployment get their real values; the batch-varying

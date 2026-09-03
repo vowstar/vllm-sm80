@@ -339,8 +339,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_positions: torch.Tensor,
         seq_lens: torch.Tensor,
         compress_ratio: int,
-        max_query_len: int,
-        max_decode_query_len: int,
+        is_prefill: bool,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -400,8 +399,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_positions[:num_tokens],
             seq_lens,
             compress_ratio,
-            max_query_len,
-            max_decode_query_len,
+            is_prefill,
             output[:num_tokens],
             # Per-layer scales as device buffers (1.0 from
             # set_default_quant_scales(register_buffer=True)): no host-to-device
@@ -463,7 +461,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.num_heads = self.total_num_heads // tp_size
         # Decode/verify batches have at most 1 + num_spec query tokens per
         # request; the sparse-attention config table splits its top region
-        # on this (long_query = max_query_len > _max_decode_query_len).
+        # on this (is_prefill = max_query_len > _max_decode_query_len).
         self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_kv_heads >= tp_size:
@@ -660,8 +658,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             logical_positions=compressed_metadata.logical_positions,
             seq_lens=compressed_metadata.seq_lens,
             compress_ratio=self.indexer.compress_ratio,
-            max_query_len=main_metadata.max_query_len,
-            max_decode_query_len=self._max_decode_query_len,
+            is_prefill=main_metadata.max_query_len > self._max_decode_query_len,
         )
 
     def forward(
