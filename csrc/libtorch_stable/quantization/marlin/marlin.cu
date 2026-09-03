@@ -315,6 +315,7 @@ exec_config_t determine_exec_config(
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
     int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
     int num_bits, int group_size, bool has_act_order, bool is_k_full,
+    int has_zp, bool is_zp_float, bool is_a_8bit, int stages,
     int max_shared_mem, int sms, int major_capability, int workspace_len) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
