@@ -31,7 +31,6 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
-    canonicalize_singleton_dim_strides,
     direct_register_custom_op,
     get_dtype_size,
     kv_cache_dtype_str_to_dtype,
@@ -375,8 +374,6 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
         if self.kv_cache_fp8:
             # Quantized caches are allocated as uint8; reinterpret as fp8 so
             # the kernel decodes floats instead of integers. view() is a pure
