@@ -24,7 +24,7 @@ this branch. It was validated at 64K context without speculative decoding.
 | GPU | sm_80. Tested only on CMP 170HX 64 GB, which has no peer to peer and a 64 MB BAR1. |
 | Cards | 4 for Qwen, 5 for GLM, 4 or 5 for DeepSeek. Tensor parallelism does not work on these cards, so the count is a pipeline depth. |
 | VRAM | 64 GB per card. The tightest rank runs within about 1.6 GiB of the limit. |
-| Host RAM | DeepSeek costs about 11 GB once serving, but weight load peaks far higher, so leave 30 GB free. Qwen needs about 70 GB, because its PLE table is 51 GB and lives in host memory. |
+| Host RAM | DeepSeek costs about 11 GB once serving, but weight load peaks far higher, so leave 30 GB free. Qwen needs about 63 GB, because its PLE table is 51 GB and lives in host memory. |
 | Disk | 156 to 170 GiB per checkpoint. |
 | Driver | 610.43.02. Other drivers are untested and the Marlin holdoff below exists because of this one. |
 
@@ -135,13 +135,13 @@ GLM PP5) and different true-concurrency caps (`--max-num-seqs`), so one
 tokens, about 1,600-token prose prompts with unique prefixes, against each live
 service:
 
-| Concurrency | Qwen aggregate | GLM aggregate | DeepSeek aggregate |
-| --- | ---: | ---: | ---: |
-| 1 | 39.7 tok/s | 63.8 tok/s | 69.2 tok/s |
-| 4 | 131.3 tok/s | 153.0 tok/s | 179.8 tok/s |
-| 8 | 221.9 tok/s | 188.3 tok/s | 215.2 tok/s |
-| 16 | 375.5 tok/s | 309.1 tok/s | 334.9 tok/s |
-| 32 | 506.0 tok/s | 432.8 tok/s | 426.6 tok/s |
+| Concurrency | Qwen aggregate | Qwen steady | GLM aggregate | DeepSeek aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 39.7 tok/s | 39.6 tok/s | 63.8 tok/s | 69.2 tok/s |
+| 4 | 131.3 tok/s | 142.4 tok/s | 153.0 tok/s | 179.8 tok/s |
+| 8 | 221.9 tok/s | 252.8 tok/s | 188.3 tok/s | 215.2 tok/s |
+| 16 | 375.5 tok/s | 432.5 tok/s | 309.1 tok/s | 334.9 tok/s |
+| 32 | 506.0 tok/s | 644.3 tok/s | 432.8 tok/s | 426.6 tok/s |
 
 Per-request median at the same points: Qwen 39.7 / 32.8 / 27.8 / 23.5 / 15.8,
 GLM 63.8 / 39.0 / 23.9 / 20.0 / 14.0, DeepSeek 80.3 / 49.9 / 29.9 / 23.3 /
@@ -161,23 +161,18 @@ against the other is the most common way these figures get misread:
 
 On a four-stage pipeline the gap between them is large and shrinks as the run
 gets longer, because a PP4 pipeline cannot reach steady state until enough
-requests are in flight. Measured on Qwen PP4, 5x CMP 170HX, prose prompts of
-about 1,600 tokens with unique prefixes so the prefix cache never hits:
+requests are in flight. The table above uses 512-token outputs, which is too
+short to fill that pipeline, so its aggregate column understates the steady
+rate everywhere. Run the same 8-stream point for longer and the two converge:
 
 | Concurrency | Output/req | Wall | aggregate | steady generation | per-request median |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 512 | 12.9 s | 39.7 tok/s | 39.6 tok/s | 39.7 tok/s |
-| 4 | 512 | 15.6 s | 131.3 tok/s | 142.4 tok/s | 32.8 tok/s |
 | 8 | 512 | 18.5 s | 221.9 tok/s | 252.8 tok/s | 27.8 tok/s |
-| 8 | 2048 | 64.6 s | **253.7 tok/s** | **259.1 tok/s** | 31.7 tok/s |
-| 16 | 512 | 21.8 s | 375.5 tok/s | 432.5 tok/s | 23.5 tok/s |
-| 32 | 512 | 32.4 s | 506.0 tok/s | 644.3 tok/s | 15.8 tok/s |
+| 8 | 2048 | 64.6 s | 253.7 tok/s | 259.1 tok/s | 31.7 tok/s |
 
-The two 8-stream rows differ only in output length. With 512-token outputs the
-run is too short for the PP4 pipeline to fill, so aggregate understates the
-steady rate; with 2048-token outputs the two converge to within 2 percent. Any
-comparison that puts one system's steady dashboard reading next to another
-system's short-run aggregate is measuring output length, not the engine.
+At 2048 tokens per request the gap is 2 percent. Any comparison that puts one
+system's steady dashboard reading next to another system's short-run aggregate
+is measuring output length, not the engine.
 
 The engine's own plateau lines for the 2048-token run, for reference:
 
@@ -197,9 +192,12 @@ every batch size the scheduler can produce, and mark the runtime integer
 scalars `do_not_specialize` so they no longer recompile per shape. 16 and 32
 concurrent streams now serve with zero first-request JIT (see the table above).
 
-A separate fix was also needed for 32 streams: the PLE offload producer used
-`put_nowait` on a one-entry queue, which killed the engine under pipeline
-parallelism; it now blocks on a 60 s bound.
+A separate fix was also needed at high concurrency. The PLE offload producer
+used a one-entry queue, sized for `pipeline_parallel_size=1` where each forward
+consumes its output before the next launch. Pipeline parallelism keeps several
+forwards in flight, so the queue filled and rank 0, the only rank holding the
+PLE embedding, took the service down. Blocking alone only defers that to the
+60 s timeout, so the queue is now sized `2 * pipeline_parallel_size`.
 
 ## DeepSeek V4 Flash and Vision
 
@@ -243,13 +241,12 @@ this fork's work.
 | 32 concurrent streams | Works, 644 tok/s steady generation |
 | Prefix caching | Works |
 | Vision tower | Loads and warms up, image accuracy not checked |
-| MTP | Not available under PP |
+| MTP | Not available under PP, upstream included |
 
 The PLE table is a 51 GB FP8 ngram embedding of 16 heads over a 20 million
 entry vocabulary, which is 51 of the model's 180 billion parameters. It stays in host memory and costs about microseconds per
 token, so it is not the decode bottleneck. It does need roughly 63 GB of host
-RAM for the whole container, and its staging thread is what fails first under
-heavy concurrency.
+RAM for the whole container.
 
 Main changes for this model:
 
@@ -260,6 +257,7 @@ Main changes for this model:
 | Model state | Disables ngram state on non first ranks rather than failing. |
 | Weight loading | Skips the final mixer weights on non last ranks. |
 | Marlin FP8 | Adds the repack holdoff that CMP 170HX needs. |
+| QSA kernels | Pre-compiles them in warmup and stops Triton specializing on runtime integers, so none JIT inside a pipeline collective. |
 
 ## GLM-5.3-Flash
 
@@ -298,9 +296,8 @@ Main changes for this model:
 Build one image from this checkout and use it for all three models. Adapt the
 GPU list and the layer partition to the target system.
 
-DeepSeek-V4-Flash-Vision-Exp on four cards. This is the tested layout, and the
-partition and the two image limit are the values the service validates
-against:
+DeepSeek-V4-Flash-Vision-Exp on four cards. This is the tested layout and the
+partition is the value the service validates against:
 
 ```bash
 docker run -d --name vllm --runtime=nvidia \
@@ -321,7 +318,6 @@ docker run -d --name vllm --runtime=nvidia \
   --no-enable-flashinfer-autotune \
   --tokenizer-mode deepseek_v4 \
   --disable-chunked-mm-input \
-  --limit-mm-per-prompt '{"image":2}' \
   --mm-processor-cache-gb 4 \
   --enable-prefix-caching \
   --reasoning-parser deepseek_v4 \
@@ -413,7 +409,6 @@ Settings that are easy to get wrong:
 | Hybrid KV capacity | Mamba state pages alias into larger blocks, so effective capacity is below the raw allocation. |
 | FP8 KV prefill | About 1.8 times slower than bfloat16 KV. Decode speed is similar and the larger cache avoids repeated prefill. |
 | Qwen host RAM | About 63 GB for the container, most of it the PLE table. Do not cold start two engines at once. |
-| Qwen MTP | Not implemented for pipeline parallelism, upstream included. |
 | No peer to peer | These cards stage GPU to GPU through host RAM at about 3 GB/s, so never use tensor parallelism. |
 | Prefix cache tests | `tests/v1/core/test_prefix_caching.py` has 17 failures on this branch. Six come from the `VLLM_APC_HEADROOM_BLOCKS` default and clear at 0. The rest are unexplained and predate the current work. |
 | NIXL connector | `register_kv_caches` has undefined names left from a merge. Nothing here passes `--kv-transfer-config`. |
