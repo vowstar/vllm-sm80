@@ -152,20 +152,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
-    # Split s walks tiles {s, s + NUM_SPLITS, s + 2*NUM_SPLITS, ...} up to the
-    # row's valid extent: a no-op bound for rows at the full budget
-    # (long-context decode) and the whole win at prefill/short context. The
-    # extent is derived in-kernel from the same inputs the indexer's expand
-    # kernel consumes (cf. the metadata builder's visible_blocks): the
-    # visible compressed blocks plus the causal tail of the open group.
+    # compute bounds
     position = tl.load(logical_positions_ptr + row)
-    seq_len = tl.load(seq_lens_ptr + safe_request).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + safe_request)
     visible = tl.minimum((position + 1) // COMPRESS_RATIO, seq_len // COMPRESS_RATIO)
     valid_count = (
         tl.minimum(visible, BLOCK_TOPK) * COMPRESS_RATIO
         + (position + 1) % COMPRESS_RATIO
-    ).to(tl.int32)
+    )
     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+
     for tile in range(split_id, tile_end, NUM_SPLITS):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
@@ -344,8 +340,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
             -float("inf"),
         )
-        # (split_id * num_rows + row) * NUM_QUERY_HEADS * HEAD_DIM can
-        # overflow int32 for large caches of partials; widen first.
         partial_row = (split_id * num_rows + row).to(tl.int64)
         tl.store(
             partial_output_ptr
@@ -380,9 +374,6 @@ def _qsa_merge_splitk_kernel(
     split_offsets = tl.arange(0, BLOCK_SPLITS)
     dim_offsets = tl.arange(0, HEAD_DIM)
     split_mask = split_offsets < NUM_SPLITS
-    # (split * num_rows + row) * NUM_QUERY_HEADS * HEAD_DIM can overflow
-    # int32 for large partial caches; widen before the multiply.
-    split_rows = split_offsets.to(tl.int64) * num_rows + row
     lse = tl.load(
         partial_lse_ptr + (split_offsets * num_rows + row) * NUM_QUERY_HEADS + head,
         mask=split_mask,
@@ -393,6 +384,7 @@ def _qsa_merge_splitk_kernel(
     shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
     weights = tl.math.exp2(shifted)
     denominator = tl.sum(weights, axis=0)
+    split_rows = split_offsets.to(tl.int64) * num_rows + row
     partial_output = tl.load(
         partial_output_ptr
         + (split_rows[:, None] * NUM_QUERY_HEADS + head) * HEAD_DIM
@@ -597,16 +589,7 @@ def _compress_qsa_groups_kernel(
 def _splitk_config(base_programs: int, long_query: bool) -> tuple[int, int, int]:
     """Return (BLOCK_N, target_splits, num_warps) for the split-K kernel.
 
-    Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 shapes under the
-    always-on valid-extent bound and the strided split walk, keyed on
-    base_programs = rows * kv_heads. Narrow 32-column tiles win through
-    mid-size batches. Past the decode table (bp > 2048) the two production
-    distributions disagree: long-query (prefill/mixed) batches are dominated
-    by clipped rows and want the narrow no-split config (+9-16%), while huge
-    uniform decode/verify batches keep the wide entry (+5-8% the other way) —
-    no single config serves both within ~3%, so the top region splits on
-    long_query (capture-stable: at FULL-graph capture max_query_len is the
-    uniform decode/verify length by construction, identical at replay).
+    Tuned on GB300 for the Qwen3.8-Flash-Next TP1, TP2, and TP4 shapes
     """
     if base_programs > 2048:
         return (32, 1, 1) if long_query else (64, 1, 2)
@@ -731,6 +714,7 @@ def qsa_sparse_paged_attention(
     assert seq_lens.shape == (block_table.shape[0],) and seq_lens.stride(0) == 1
     assert logical_positions.device == seq_lens.device == q.device
     assert compress_ratio > 0
+
     # Selection width = block_topk * compress_ratio + compress_ratio - 1.
     block_topk = (logical_indices.shape[1] + 1 - compress_ratio) // compress_ratio
     if out is None:
@@ -890,12 +874,7 @@ def warmup_qsa_sparse_paged_attention(
     selection_width: int,
     compress_ratio: int,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Compile every production-reachable split-K/merge specialization.
-
-    Covers every config the dispatch can pick for this rank's group size.
-    kv_cache and block_table are the owner's bound tensors; only their
-    shapes and strides (part of the Triton cache key) are read.
-    """
+    """Compile every production-reachable split-K/merge specialization."""
 
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
