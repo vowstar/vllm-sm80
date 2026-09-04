@@ -142,6 +142,35 @@ def _make_problem(dev, num_rows: int, seed: int = 0):
     return num_blocks, q, block_table, token_to_req, indices
 
 
+COMPRESS_RATIO = 4
+
+
+def _run_sparse(q, k_cache, v_cache, indices, block_table, token_to_req, **kwargs):
+    """Call the kernel wrapper with metadata that keeps the whole selection
+    inside the kernel's in-kernel valid extent (positions at SEQ_LEN - 1 give
+    a valid_count of block_topk * COMPRESS_RATIO, past every valid column)."""
+    rows = q.shape[0]
+    logical_positions = torch.full(
+        (rows,), SEQ_LEN - 1, dtype=torch.int64, device=q.device
+    )
+    seq_lens = torch.full(
+        (block_table.shape[0],), SEQ_LEN, dtype=torch.int32, device=q.device
+    )
+    return qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        indices,
+        block_table,
+        token_to_req,
+        logical_positions,
+        seq_lens,
+        COMPRESS_RATIO,
+        False,
+        **kwargs,
+    )
+
+
 def _assert_kernel_matches(out_quant, ref_quant, out_bf16, ref_bf16) -> None:
     r_bf16 = _rel_error(out_bf16, ref_bf16)
     r_kernel = _rel_error(out_quant, ref_quant)
@@ -160,10 +189,10 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
     ).bfloat16()
     one = torch.tensor(1.0, dtype=torch.float32, device=dev)
 
-    out_bf16 = qsa_sparse_paged_attention(
+    out_bf16 = _run_sparse(
         q, k_cache, v_cache, indices, block_table, token_to_req
     )
-    out_bf16_scaled = qsa_sparse_paged_attention(
+    out_bf16_scaled = _run_sparse(
         q,
         k_cache,
         v_cache,
@@ -189,7 +218,7 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
         block_table,
         token_to_req,
     )
-    out_fp8 = qsa_sparse_paged_attention(
+    out_fp8 = _run_sparse(
         q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
     )
     _assert_kernel_matches(out_fp8, ref_fp8, out_bf16, ref_bf16)
@@ -209,7 +238,7 @@ def test_qsa_fp8_kv_tile_profiles(num_rows: int) -> None:
     one = torch.tensor(1.0, dtype=torch.float32, device=dev)
     k_fp8 = k_cache.to(torch.float8_e4m3fn)
     v_fp8 = v_cache.to(torch.float8_e4m3fn)
-    out_deq = qsa_sparse_paged_attention(
+    out_deq = _run_sparse(
         q,
         k_fp8.to(torch.bfloat16),
         v_fp8.to(torch.bfloat16),
@@ -217,7 +246,7 @@ def test_qsa_fp8_kv_tile_profiles(num_rows: int) -> None:
         block_table,
         token_to_req,
     )
-    out_fp8 = qsa_sparse_paged_attention(
+    out_fp8 = _run_sparse(
         q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
     )
     assert (out_fp8.double() - out_deq.double()).abs().max().item() < 5e-3
@@ -318,10 +347,10 @@ def test_qsa_nvfp4_kv_matches_dequantized_reference(num_rows: int) -> None:
     v_deq = v_deq.contiguous()
     k_data, k_sf, v_data, v_sf = qsa_backend._nvfp4_cache_views(kv_cache, NUM_KV_HEADS)
 
-    out_deq = qsa_sparse_paged_attention(
+    out_deq = _run_sparse(
         q, k_deq, v_deq, indices, block_table, token_to_req
     )
-    out_nvfp4 = qsa_sparse_paged_attention(
+    out_nvfp4 = _run_sparse(
         q,
         k_data,
         v_data,
@@ -341,7 +370,7 @@ def test_qsa_nvfp4_kv_matches_dequantized_reference(num_rows: int) -> None:
     if num_rows == 5:
         kb = key.reshape(num_blocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM).contiguous()
         vb = value.reshape(num_blocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM).contiguous()
-        out_bf16 = qsa_sparse_paged_attention(
+        out_bf16 = _run_sparse(
             q, kb, vb, indices, block_table, token_to_req
         )
         ref_bf16 = _reference(q, kb, vb, indices, block_table, token_to_req)

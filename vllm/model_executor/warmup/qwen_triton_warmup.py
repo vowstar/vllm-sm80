@@ -402,18 +402,29 @@ def _warm_qsa_kernels(
 
     # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
     # are picked from base_programs = rows * num_kv_heads, so walk every
-    # bucket boundary. Reuse the live attention cache (transposed and split
-    # exactly as forward_qsa does) so PAGE_SIZE and the K/V interleaved stride
-    # match the real path instead of a guessed torch.empty.
+    # bucket boundary. Reuse the live attention cache (viewed exactly as
+    # forward_qsa does, including the fp8/nvfp4 detours) so PAGE_SIZE and the
+    # K/V strides match the real path instead of a guessed torch.empty.
     attention = _find_qsa_attention(runner)
     if (
         attention is not None
         and num_q_heads and num_kv_heads and main_head_dim and main_page_table_width
     ):
         attn_head_dim = int(attention.head_dim)
-        key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
-            attn_head_dim, dim=-1
-        )
+        impl = getattr(attention, "impl", None)
+        k_scale_cache = None
+        v_scale_cache = None
+        if impl is not None and getattr(impl, "kv_cache_nvfp4", False):
+            key_cache, k_scale_cache, value_cache, v_scale_cache = (
+                impl._nvfp4_views_for(attention.kv_cache)
+            )
+        else:
+            key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
+                attn_head_dim, dim=-1
+            )
+            if impl is not None and getattr(impl, "kv_cache_fp8", False):
+                key_cache = key_cache.view(torch.float8_e4m3fn)
+                value_cache = value_cache.view(torch.float8_e4m3fn)
         logger.info(
             "QSA splitk warmup: live cache %s -> key_cache %s.",
             tuple(attention.kv_cache.shape), tuple(key_cache.shape),
@@ -430,10 +441,31 @@ def _warm_qsa_kernels(
                     (num_reqs, main_page_table_width), dtype=torch.int32, device=device
                 )
                 token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-                qsa_sparse_paged_attention(
-                    q, key_cache, value_cache, logical_indices, block_table,
-                    token_to_req,
+                # Same dtypes as the QSA side-cache metadata on the real path.
+                logical_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+                seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
+                # is_prefill only steers the top config-table region; warm both
+                # sides once the batch can reach it.
+                prefill_flags = (
+                    (False, True) if rows * num_kv_heads > 2048 else (False,)
                 )
+                for is_prefill in prefill_flags:
+                    qsa_sparse_paged_attention(
+                        q,
+                        key_cache,
+                        value_cache,
+                        logical_indices,
+                        block_table,
+                        token_to_req,
+                        logical_positions,
+                        seq_lens,
+                        compress_ratio,
+                        is_prefill,
+                        k_scale=getattr(attention, "_k_scale", None),
+                        v_scale=getattr(attention, "_v_scale", None),
+                        k_scale_cache=k_scale_cache,
+                        v_scale_cache=v_scale_cache,
+                    )
 
     # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on
     # num_tokens <= 4096, so warm both sides. num_k_work = 0 compiles the whole

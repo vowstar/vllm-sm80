@@ -864,11 +864,30 @@ def warmup_qsa_sparse_paged_attention(
     num_query_heads: int,
     selection_width: int,
     compress_ratio: int,
+    kv_cache_fp8: bool = False,
+    kv_cache_nvfp4: bool = False,
 ) -> tuple[tuple[int, int, int], ...]:
     """Compile every production-reachable split-K/merge specialization."""
 
+    quantized = kv_cache_fp8 or kv_cache_nvfp4
     head_dim = kv_cache.shape[-1] // 2
-    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    k_scale_cache: torch.Tensor | None = None
+    v_scale_cache: torch.Tensor | None = None
+    if kv_cache_nvfp4:
+        # Same view arithmetic as the production read path
+        # (Qwen4ExpQSAFlashAttentionImpl._nvfp4_views_for).
+        from vllm.models.qwen4_exp.nvidia.qsa import _nvfp4_cache_views
+
+        num_kv_heads = kv_cache.shape[1] // 2
+        key_cache, k_scale_cache, value_cache, v_scale_cache = _nvfp4_cache_views(
+            kv_cache, num_kv_heads
+        )
+        head_dim = key_cache.shape[-1] * 2
+    else:
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+        if kv_cache_fp8:
+            key_cache = key_cache.view(torch.float8_e4m3fn)
+            value_cache = value_cache.view(torch.float8_e4m3fn)
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
@@ -898,6 +917,31 @@ def warmup_qsa_sparse_paged_attention(
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )
+    # On the bf16 path the production wrapper passes the (bf16) query for the
+    # compiled-out scale arguments; match that so the warmup compiles the
+    # exact production specialization. Quantized paths pass fp32 per-layer
+    # scales and, for nvfp4, the uint8 block-scale pages.
+    scale_arg_dtype = torch.float32 if quantized else torch.bfloat16
+    k_scale_ptr = TritonWarmupTensor(scale_arg_dtype)
+    v_scale_ptr = TritonWarmupTensor(scale_arg_dtype)
+    if kv_cache_nvfp4:
+        assert k_scale_cache is not None and v_scale_cache is not None
+        k_sf_ptr = TritonWarmupTensor(
+            k_scale_cache.dtype,
+            shape=tuple(k_scale_cache.shape),
+            strides=tuple(k_scale_cache.stride()),
+        )
+        v_sf_ptr = TritonWarmupTensor(
+            v_scale_cache.dtype,
+            shape=tuple(v_scale_cache.shape),
+            strides=tuple(v_scale_cache.stride()),
+        )
+        ks_strides = k_scale_cache.stride()
+        vs_strides = v_scale_cache.stride()
+    else:
+        k_sf_ptr = q_ptr
+        v_sf_ptr = q_ptr
+        ks_strides = vs_strides = (0, 0, 0)
     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width))
     block_table_ptr = TritonWarmupTensor(
         block_table.dtype,
@@ -916,6 +960,13 @@ def warmup_qsa_sparse_paged_attention(
 
     warmed = []
     for block_n, target_splits, warps in sorted(profiles):
+        # Mirror the production wrapper: quantized wide tiles run one stage,
+        # and nvfp4 halves the wide tile.
+        num_stages = 2
+        if quantized and block_n > 16:
+            if kv_cache_nvfp4:
+                block_n = 32
+            num_stages = 1
         num_tiles = triton.cdiv(selection_width, block_n)
         max_useful_splits = 1 << (num_tiles.bit_length() - 1)
         num_splits = min(max_useful_splits, target_splits)
@@ -934,6 +985,10 @@ def warmup_qsa_sparse_paged_attention(
             q_ptr,
             k_cache_ptr,
             v_cache_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
+            k_sf_ptr,
+            v_sf_ptr,
             indices_ptr,
             block_table_ptr,
             token_to_req_ptr,
@@ -950,6 +1005,12 @@ def warmup_qsa_sparse_paged_attention(
             value_cache.stride(0),
             value_cache.stride(1),
             value_cache.stride(2),
+            ks_strides[0],
+            ks_strides[1],
+            ks_strides[2],
+            vs_strides[0],
+            vs_strides[1],
+            vs_strides[2],
             selection_width,
             block_table.stride(0),
             row_stride,
@@ -969,8 +1030,11 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_N=block_n,
             COMPRESS_RATIO=compress_ratio,
             BLOCK_TOPK=block_topk,
+            KV_QUANT_FP8=kv_cache_fp8,
+            KV_QUANT_NVFP4=kv_cache_nvfp4,
+            V_SCALE_SWIZZLED=True,
             num_warps=warps,
-            num_stages=2,
+            num_stages=num_stages,
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:

@@ -76,12 +76,15 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
 
     kv_cache = owner.kv_cache
     assert kv_cache.numel()
+    impl = getattr(owner, "impl", None)
     attention_profiles = warmup_qsa_sparse_paged_attention(
         kv_cache,
         block_table_for(owner.layer_name),
         num_query_heads=owner.num_heads,
         selection_width=indexer.output_width,
         compress_ratio=indexer.compress_ratio,
+        kv_cache_fp8=bool(getattr(impl, "kv_cache_fp8", False)),
+        kv_cache_nvfp4=bool(getattr(impl, "kv_cache_nvfp4", False)),
     )
     logger.info(
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
