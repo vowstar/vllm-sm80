@@ -342,23 +342,26 @@ def _warm_qsa_kernels(
         main_page_table_width, cache_block_size, num_q_heads, num_kv_heads,
         main_head_dim,
     )
-    # Triton specializes the mqa and splitk kernels on num_requests (the block
-    # table's request dim) at the exact value, so warm every batch size the
-    # scheduler can produce. A missed size JITs on its first request and, on a
+    # The indexer kernels carry do_not_specialize on their runtime row and
+    # request counts, so one launch per kernel compiles every reachable
+    # batch-size variant. The splitk kernel below still picks NUM_SPLITS /
+    # BLOCK_N from the batch shape, so it keeps the full batch-size walk. A
+    # missed specialization JITs on its first request and, on a
     # pipeline-parallel rank, can land inside a collective and deadlock.
     num_reqs_choices = tuple(range(1, 33))
     bf16 = torch.bfloat16
 
-    # Kernels 2+3: _qsa_mqa_paged_kernel and _expand_qsa_indices_kernel.
-    # rows <= 32 and rows > 32 select different TILES_PER_PROG specializations.
-    # columns = page_table_width * page_size (~8M here) would push the launch
-    # grid past CUDA's 65535 Y limit at rows <= 32. columns is a runtime arg,
-    # not a constexpr, so clamping it via num_columns keeps the grid legal
-    # without changing the compiled specialization.
+    # Kernels 2+3: the QSA indexer prefill scoring kernel and
+    # _expand_qsa_indices_kernel, reached through their public select/expand
+    # wrappers. The uniform decode scoring kernel is warmed separately by
+    # qwen4_exp_qsa_triton_warmup across every reachable decode-query-length
+    # specialization.
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        expand_qsa_block_indices_cuda,
-        qsa_mqa_paged,
         qsa_sparse_paged_attention,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
+        expand_qsa_block_indices,
+        qsa_select_paged_prefill,
     )
 
     block_topk = token_topk // compress_ratio
@@ -366,54 +369,73 @@ def _warm_qsa_kernels(
         "QSA mqa warmup: comp_cache %s dtype=%s; comp page_table w=%d.",
         tuple(comp_cache.shape), comp_cache.dtype, comp_page_table_width,
     )
-    for num_reqs in num_reqs_choices:
-        for rows in (1, 33):
-            q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
-            page_table = torch.zeros(
-                (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
-            )
-            token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-            # query_positions is logical_positions on the real path, int64.
-            query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
-            sequence_lengths = torch.ones(num_reqs, dtype=torch.int32, device=device)
-            qsa_mqa_paged(
-                q,
-                comp_cache,
-                page_table,
-                token_to_req,
-                query_positions,
-                sequence_lengths,
-                compress_ratio,
-                num_columns=4096,
-            )
-            block_indices = torch.zeros(
-                (rows, block_topk), dtype=torch.int32, device=device
-            )
-            out = torch.zeros((rows, output_width), dtype=torch.int32, device=device)
-            expand_qsa_block_indices_cuda(
-                block_indices,
-                query_positions,
-                sequence_lengths,
-                token_to_req,
-                compress_ratio,
-                token_topk,
-                out,
-            )
+    for num_reqs, rows in ((1, 1), (32, 33)):
+        q = torch.empty((rows, n_heads, head_dim), dtype=bf16, device=device)
+        page_table = torch.zeros(
+            (num_reqs, comp_page_table_width), dtype=torch.int32, device=device
+        )
+        # query_positions is logical_positions on the real path, int64.
+        query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        # All query rows in the first request; offsets are non-decreasing.
+        query_start_loc = torch.zeros(
+            num_reqs + 1, dtype=torch.int32, device=device
+        )
+        query_start_loc[1:] = rows
+        visible_blocks = torch.zeros(rows, dtype=torch.int32, device=device)
+        block_indices = torch.zeros(
+            (rows, block_topk), dtype=torch.int32, device=device
+        )
+        qsa_select_paged_prefill(
+            q,
+            comp_cache,
+            page_table,
+            query_start_loc,
+            visible_blocks,
+            token_topk,
+            compress_ratio,
+            rows,
+            block_indices,
+            # Widest case the deployment can produce; the logits row width is
+            # rounded to 64 inside, so every runtime max_seq_len lands in the
+            # same stride-specialization class.
+            max_len,
+        )
+        # +1: the packed buffer's trailing valid-count column.
+        out = torch.zeros((rows, output_width + 1), dtype=torch.int32, device=device)
+        expand_qsa_block_indices(
+            block_indices,
+            query_positions,
+            visible_blocks,
+            compress_ratio,
+            token_topk,
+            out,
+        )
 
     # Kernel 4: _qsa_sparse_paged_gqa_splitk_kernel. Its NUM_SPLITS / BLOCK_N
     # are picked from base_programs = rows * num_kv_heads, so walk every
-    # bucket boundary. Reuse the live attention cache (transposed and split
-    # exactly as forward_qsa does) so PAGE_SIZE and the K/V interleaved stride
-    # match the real path instead of a guessed torch.empty.
+    # bucket boundary. Reuse the live attention cache (viewed exactly as
+    # forward_qsa does, including the fp8/nvfp4 detours) so PAGE_SIZE and the
+    # K/V strides match the real path instead of a guessed torch.empty.
     attention = _find_qsa_attention(runner)
     if (
         attention is not None
         and num_q_heads and num_kv_heads and main_head_dim and main_page_table_width
     ):
         attn_head_dim = int(attention.head_dim)
-        key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
-            attn_head_dim, dim=-1
-        )
+        impl = getattr(attention, "impl", None)
+        k_scale_cache = None
+        v_scale_cache = None
+        if impl is not None and getattr(impl, "kv_cache_nvfp4", False):
+            key_cache, k_scale_cache, value_cache, v_scale_cache = (
+                impl._nvfp4_views_for(attention.kv_cache)
+            )
+        else:
+            key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
+                attn_head_dim, dim=-1
+            )
+            if impl is not None and getattr(impl, "kv_cache_fp8", False):
+                key_cache = key_cache.view(torch.float8_e4m3fn)
+                value_cache = value_cache.view(torch.float8_e4m3fn)
         logger.info(
             "QSA splitk warmup: live cache %s -> key_cache %s.",
             tuple(attention.kv_cache.shape), tuple(key_cache.shape),
@@ -423,17 +445,35 @@ def _warm_qsa_kernels(
                 q = torch.empty(
                     (rows, num_q_heads, attn_head_dim), dtype=bf16, device=device
                 )
+                # Packed selection buffer: trailing column holds the row's
+                # valid-entry count; a full count covers every tile.
                 logical_indices = torch.zeros(
-                    (rows, output_width), dtype=torch.int32, device=device
+                    (rows, output_width + 1), dtype=torch.int32, device=device
                 )
+                logical_indices[:, -1] = output_width
                 block_table = torch.zeros(
                     (num_reqs, main_page_table_width), dtype=torch.int32, device=device
                 )
                 token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-                qsa_sparse_paged_attention(
-                    q, key_cache, value_cache, logical_indices, block_table,
-                    token_to_req,
+                # is_prefill only steers the top config-table region; warm both
+                # sides once the batch can reach it.
+                prefill_flags = (
+                    (False, True) if rows * num_kv_heads > 2048 else (False,)
                 )
+                for is_prefill in prefill_flags:
+                    qsa_sparse_paged_attention(
+                        q,
+                        key_cache,
+                        value_cache,
+                        logical_indices,
+                        block_table,
+                        token_to_req,
+                        is_prefill,
+                        k_scale=getattr(attention, "_k_scale", None),
+                        v_scale=getattr(attention, "_v_scale", None),
+                        k_scale_cache=k_scale_cache,
+                        v_scale_cache=v_scale_cache,
+                    )
 
     # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on
     # num_tokens <= 4096, so warm both sides. num_k_work = 0 compiles the whole

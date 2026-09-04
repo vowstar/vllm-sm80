@@ -31,7 +31,6 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
-    canonicalize_singleton_dim_strides,
     direct_register_custom_op,
     get_dtype_size,
     kv_cache_dtype_str_to_dtype,
@@ -337,6 +336,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        use_prefill_config: bool,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -370,8 +370,6 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
         if self.kv_cache_fp8:
             # Quantized caches are allocated as uint8; reinterpret as fp8 so
             # the kernel decodes floats instead of integers. view() is a pure
@@ -395,6 +393,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
+            use_prefill_config,
             output[:num_tokens],
             # Per-layer scales as device buffers (1.0 from
             # set_default_quant_scales(register_buffer=True)): no host-to-device
@@ -454,6 +453,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.total_num_heads % tp_size:
             raise ValueError("QSA attention heads must be divisible by TP size")
         self.num_heads = self.total_num_heads // tp_size
+        # Decode/verify batches have at most 1 + num_spec query tokens per
+        # request; use_prefill_config (max_query_len > this) steers the
+        # config table. Shorter batches take the decode profile — harmless,
+        # the difference is tile-shape tuning, not correctness.
+        self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_kv_heads >= tp_size:
             if self.total_num_kv_heads % tp_size:
@@ -557,11 +561,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             prefix=f"{prefix}.indexer",
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        # PACKED selection buffer: the trailing column holds each row's
+        # valid-entry count (written by the expand kernel) — never a token
+        # index; the sparse attention kernel reads it as its loop bound.
+        # MTP skip_topk steps reuse rows frozen from step 0; the count is
+        # a row column, so compaction/reuse keep it paired with the content.
         self.register_buffer(
             "topk_indices_buffer",
             torch.empty(
                 max_tokens,
-                self.indexer.output_width,
+                self.indexer.packed_output_width,
                 dtype=torch.int32,
             ),
             persistent=False,
@@ -620,10 +629,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             positions,
             self.topk_indices_buffer[:num_tokens],
         )
-        if selected.shape != (
-            num_tokens,
-            self.indexer.output_width,
-        ):
+        if selected.shape != (num_tokens, self.indexer.packed_output_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         impl.do_kv_cache_update(
@@ -642,6 +648,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
         )
 
     def forward(
