@@ -32,7 +32,10 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -63,6 +66,24 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
+
+
+def _duplicate_context_wkv_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Load every draft layer's WKV into the cross-layer projection."""
+    for name, weight in weights:
+        yield name, weight
+        match = _CONTEXT_WKV_RE.fullmatch(name)
+        if match is None:
+            continue
+        layer_idx = int(match.group(1))
+        if layer_idx >= num_layers:
+            continue
+        stacked_weight = weight.detach()
+        stacked_weight.shard_id = layer_idx
+        yield f"context_wkv_proj.{match.group(2)}", stacked_weight
 
 
 def _remap_pp_owned_dspark_weight(name: str, use_pp: bool) -> str | None:
@@ -147,6 +168,15 @@ class DSparkDeepseekV4Model(nn.Module):
                 for i in range(self.num_dspark_layers)
             ]
         )
+        self.context_wkv_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.head_dim] * self.num_dspark_layers,
+            bias=False,
+            return_bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "context_wkv_proj"),
+            disable_tp=True,
+        )
 
         # Heads: final norm + hc_head, and the Markov + confidence heads
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
@@ -210,15 +240,16 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
+        all_kv = self.context_wkv_proj(main_x).view(
+            main_x.shape[0], self.num_dspark_layers, self.config.head_dim
+        )
+        for i, (layer, kv) in enumerate(
+            zip(self.layers, all_kv.unbind(1), strict=True)
+        ):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
@@ -404,6 +435,21 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
+    def apply_markov_bias_gathered(
+        self,
+        markov_embed: torch.Tensor,
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.markov_head.apply_bias_gathered(
+            markov_embed,
+            logits,
+            values,
+            index,
+            self.logits_processor.scale,
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
@@ -471,6 +517,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_end = n_local_head * (tp_rank + 1)
 
         load_own_embed = get_pp_group().world_size > 1
+        weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
         for name, loaded_weight in weights:
             # Under PP the drafter exists only on the last rank, while the
             # target embedding exists only on the first. Keep and load the
@@ -498,6 +545,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
                 )
+
+            if name.startswith("model.context_wkv_proj."):
+                param = params_dict[name]
+                param.weight_loader(param, loaded_weight, loaded_weight.shard_id)
+                loaded_params.add(name)
+                continue
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
@@ -570,6 +623,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         Returns None for non-mtp weights (owned by the target model).
         """
+        if name.startswith("context_wkv_proj."):
+            return f"model.{name}"
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None
