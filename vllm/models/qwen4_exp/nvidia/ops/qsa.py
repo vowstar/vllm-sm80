@@ -243,7 +243,6 @@ def _nvfp4_scale_coord(slot, group, SWIZZLED: tl.constexpr, SCALE_DIM: tl.conste
     return slot + group * 0, group + slot * 0
 
 
-@triton.jit
 @triton.jit(do_not_specialize=["num_rows", "num_cache_blocks", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
