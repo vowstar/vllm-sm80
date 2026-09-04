@@ -580,18 +580,20 @@ def _compress_qsa_groups_kernel(
 
 
 def _select_config(
-    num_rows: int, num_kv_heads: int, is_prefill: bool, num_columns: int
+    num_rows: int, num_kv_heads: int, use_prefill_config: bool, num_columns: int
 ) -> tuple[int, int, int, int]:
     """Select (block_n, num_warps, num_tiles, num_splits) for the kernel.
 
     Tuned on GB300 for the Qwen3.8-Flash-Next TP1/TP2/TP4 shapes, keyed on
     base_programs = num_rows * num_kv_heads. The bp > 2048 region splits on
-    is_prefill (capture-stable: at FULL-graph capture max_query_len is the
+    use_prefill_config (capture-stable: at FULL-graph capture max_query_len is the
     uniform decode/verify length).
     """
     base_programs = num_rows * num_kv_heads
     if base_programs > 2048:
-        BLOCK_N, target_splits, num_warps = (32, 1, 1) if is_prefill else (64, 1, 2)
+        BLOCK_N, target_splits, num_warps = (
+            (32, 1, 1) if use_prefill_config else (64, 1, 2)
+        )
     elif base_programs <= 24:
         BLOCK_N, target_splits, num_warps = 32, 64, 4
     elif base_programs <= 32:
@@ -619,7 +621,7 @@ def qsa_sparse_paged_attention(
     logical_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
-    is_prefill: bool,
+    use_prefill_config: bool,
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
@@ -641,8 +643,8 @@ def qsa_sparse_paged_attention(
     tile-loop bound — cost-neutral for full-budget rows and the whole win
     where selections are causally padded. The strided split walk smooths wave
     quantization and is locality-neutral because selections are
-    score-rank-ordered, not position-ordered. is_prefill only steers the top
-    of the config table; see _select_config.
+    score-rank-ordered, not position-ordered. use_prefill_config only steers
+    the top of the config table; see _select_config.
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -711,7 +713,7 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
-        q.shape[0], k_cache.shape[2], is_prefill, selection_width
+        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
     )
 
     # Quantized caches need shared memory for the dequantized bf16 tiles next
@@ -875,9 +877,9 @@ def warmup_qsa_sparse_paged_attention(
 
     # Every config the dispatch can pick for this group size.
     profiles = {
-        _select_config(num_rows, num_kv_heads, is_prefill, selection_width)
+        _select_config(num_rows, num_kv_heads, use_prefill_config, selection_width)
         for num_rows in range(1, 8193)
-        for is_prefill in (False, True)
+        for use_prefill_config in (False, True)
     }
 
     # Scalars constant per deployment get their real values (their divisibility
