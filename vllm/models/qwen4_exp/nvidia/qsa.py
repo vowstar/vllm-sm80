@@ -50,6 +50,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.fp8_sm80 import native_fp8_cast_supported
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -71,7 +72,8 @@ _QSA_KV_CACHE_DTYPES: tuple[str, ...] = ("auto", "bfloat16", "fp8", "fp8_e4m3", 
 
 # Storage dtypes of the main cache. Quantized caches are allocated as uint8
 # (STR_DTYPE_TO_TORCH_DTYPE); the bytes are reinterpreted right before the
-# kernel.
+# kernel, except pre-SM89 where Triton cannot type fp8 pointers and the
+# wrapper learns fp8 through its kv_cache_fp8 flag instead.
 _QSA_KV_STORAGE_DTYPES = (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
 
 # Block-scale layout written by reshape_and_cache_flash for nvfp4: K block
@@ -278,6 +280,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         self.kv_cache_fp8 = (
             is_quantized_kv_cache(self.kv_cache_dtype) and not self.kv_cache_nvfp4
         )
+        # Pre-SM89 Triton cannot type fp8e4nv pointers, so the e4m3fn cache
+        # stays uint8 there and the kernel decodes bytes in registers; the
+        # wrapper learns fp8 through the explicit flag, not the dtype.
+        self._kv_fp8_via_uint8 = self.kv_cache_fp8 and not native_fp8_cast_supported()
         # Strided views on the packed nvfp4 cache, built once per cache buffer.
         # as_strided is metadata only, but it would otherwise run in every
         # decode step, and the pointers stay stable across CUDA graph capture.
@@ -370,7 +376,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
-        if self.kv_cache_fp8:
+        if self.kv_cache_fp8 and not self._kv_fp8_via_uint8:
             # Quantized caches are allocated as uint8; reinterpret as fp8 so
             # the kernel decodes floats instead of integers. view() is a pure
             # reinterpretation (1 byte to 1 byte, unit stride on the last dim).
@@ -403,6 +409,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
             v_scale_swizzled=_NVFP4_V_SCALE_SWIZZLED,
+            kv_cache_fp8=self.kv_cache_fp8,
         )
         return output
 

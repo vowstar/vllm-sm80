@@ -20,6 +20,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim, nvfp4_split_data_scale
+from vllm.v1.attention.ops.fp8_sm80 import native_fp8_cast_supported
 
 requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
@@ -165,6 +166,17 @@ def _run_sparse(q, k_cache, v_cache, indices, block_table, token_to_req, **kwarg
     )
 
 
+def _fp8_kernel_args(k: torch.Tensor, v: torch.Tensor):
+    """Mirror the production reinterpret of an fp8 cache: fp8 dtype where
+    Triton types fp8e4nv pointers, raw uint8 bytes plus kv_cache_fp8
+    elsewhere (pre-SM89 Triton cannot type fp8e4nv pointers)."""
+    if native_fp8_cast_supported():
+        return k.view(torch.uint8).view(torch.float8_e4m3fn), v.view(
+            torch.uint8
+        ).view(torch.float8_e4m3fn), {}
+    return k.view(torch.uint8), v.view(torch.uint8), {"kv_cache_fp8": True}
+
+
 def _assert_kernel_matches(out_quant, ref_quant, out_bf16, ref_bf16) -> None:
     r_bf16 = _rel_error(out_bf16, ref_bf16)
     r_kernel = _rel_error(out_quant, ref_quant)
@@ -199,10 +211,10 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
     # The bf16 branch must not change with the scale arguments present.
     assert torch.equal(out_bf16, out_bf16_scaled)
 
-    # Quantized caches are allocated as uint8 by vLLM and reinterpreted right
-    # before the kernel; the test takes the same detour.
-    k_fp8 = k_cache.to(torch.float8_e4m3fn).view(torch.uint8).view(torch.float8_e4m3fn)
-    v_fp8 = v_cache.to(torch.float8_e4m3fn).view(torch.uint8).view(torch.float8_e4m3fn)
+    # Quantized caches are allocated as uint8 by vLLM; the kernel arguments
+    # follow the production reinterpret (_fp8_kernel_args).
+    k_fp8 = k_cache.to(torch.float8_e4m3fn)
+    v_fp8 = v_cache.to(torch.float8_e4m3fn)
     ref_bf16 = _reference(q, k_cache, v_cache, indices, block_table, token_to_req)
     ref_fp8 = _reference(
         q,
@@ -212,8 +224,17 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
         block_table,
         token_to_req,
     )
+    k_arg, v_arg, fp8_kwargs = _fp8_kernel_args(k_fp8, v_fp8)
     out_fp8 = _run_sparse(
-        q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
+        q,
+        k_arg,
+        v_arg,
+        indices,
+        block_table,
+        token_to_req,
+        k_scale=one,
+        v_scale=one,
+        **fp8_kwargs,
     )
     _assert_kernel_matches(out_fp8, ref_fp8, out_bf16, ref_bf16)
 
@@ -240,8 +261,17 @@ def test_qsa_fp8_kv_tile_profiles(num_rows: int) -> None:
         block_table,
         token_to_req,
     )
+    k_arg, v_arg, fp8_kwargs = _fp8_kernel_args(k_fp8, v_fp8)
     out_fp8 = _run_sparse(
-        q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
+        q,
+        k_arg,
+        v_arg,
+        indices,
+        block_table,
+        token_to_req,
+        k_scale=one,
+        v_scale=one,
+        **fp8_kwargs,
     )
     assert (out_fp8.double() - out_deq.double()).abs().max().item() < 5e-3
 

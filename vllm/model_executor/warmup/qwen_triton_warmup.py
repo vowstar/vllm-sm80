@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.fp8_sm80 import native_fp8_cast_supported
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -425,6 +426,7 @@ def _warm_qsa_kernels(
         impl = getattr(attention, "impl", None)
         k_scale_cache = None
         v_scale_cache = None
+        kv_cache_fp8 = impl is not None and getattr(impl, "kv_cache_fp8", False)
         if impl is not None and getattr(impl, "kv_cache_nvfp4", False):
             key_cache, k_scale_cache, value_cache, v_scale_cache = (
                 impl._nvfp4_views_for(attention.kv_cache)
@@ -433,7 +435,9 @@ def _warm_qsa_kernels(
             key_cache, value_cache = attention.kv_cache.transpose(1, 2).split(
                 attn_head_dim, dim=-1
             )
-            if impl is not None and getattr(impl, "kv_cache_fp8", False):
+            if kv_cache_fp8 and native_fp8_cast_supported():
+                # Same as forward_qsa: pre-SM89 the cache stays uint8 and the
+                # wrapper learns fp8 through kv_cache_fp8 below.
                 key_cache = key_cache.view(torch.float8_e4m3fn)
                 value_cache = value_cache.view(torch.float8_e4m3fn)
         logger.info(
@@ -473,6 +477,7 @@ def _warm_qsa_kernels(
                         v_scale=getattr(attention, "_v_scale", None),
                         k_scale_cache=k_scale_cache,
                         v_scale_cache=v_scale_cache,
+                        kv_cache_fp8=kv_cache_fp8,
                     )
 
     # Kernel 1: _qsa_pre_indexer_kernel. TILE_T_Q/TILE_H_Q split on

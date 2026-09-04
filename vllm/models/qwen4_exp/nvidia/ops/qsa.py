@@ -11,6 +11,10 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import (
+    _e4m3fn_to_f32_alu,
+    native_fp8_cast_supported,
+)
 
 
 @triton.jit
@@ -117,8 +121,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     # Compile-time branch selection. With both False the dequantization code
-    # is compiled out and the bf16 path is unchanged.
+    # is compiled out and the bf16 path is unchanged. FP8_VIA_UINT8 marks the
+    # pre-SM89 fp8 path: the e4m3fn cache is passed as uint8 (Triton cannot
+    # type fp8e4nv pointers there) and decoded in registers.
     KV_QUANT_FP8: tl.constexpr = False,
+    FP8_VIA_UINT8: tl.constexpr = False,
     KV_QUANT_NVFP4: tl.constexpr = False,
     V_SCALE_SWIZZLED: tl.constexpr = True,
 ) -> None:
@@ -289,6 +296,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 # Never feed fp8 into tl.dot directly (Triton cannot multiply
                 # fp8e4nv on SM12x). Upcast to the query dtype, apply the
                 # per-layer scale, cast back.
+                if FP8_VIA_UINT8:
+                    # sm_80: the tiles are raw e4m3fn bytes from uint8
+                    # pointers. Masked lanes load 0x00, which decodes to 0.0.
+                    keys = _e4m3fn_to_f32_alu(keys)
+                    values = _e4m3fn_to_f32_alu(values)
                 keys = keys.to(query.dtype)
                 keys = (keys * tl.load(k_scale_ptr)).to(query.dtype)
                 values = values.to(query.dtype)
@@ -627,6 +639,7 @@ def qsa_sparse_paged_attention(
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
     v_scale_swizzled: bool = True,
+    kv_cache_fp8: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8-E4M3 or NVFP4 K/V caches.
 
@@ -634,7 +647,10 @@ def qsa_sparse_paged_attention(
     tensors), required for quantized caches. For nvfp4, ``k_cache`` /
     ``v_cache`` are the packed data pages (uint8, last dim ``head_dim // 2``)
     and ``k_scale_cache`` / ``v_scale_cache`` the block-scale pages (uint8,
-    last dim ``head_dim // 16``).
+    last dim ``head_dim // 16``). ``kv_cache_fp8`` declares an fp8 cache held
+    as raw uint8 bytes, the form pre-SM89 Triton requires (it cannot type
+    fp8e4nv pointers); elsewhere fp8 is recognized by dtype and the flag is
+    redundant but harmless.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
@@ -666,7 +682,9 @@ def qsa_sparse_paged_attention(
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
     assert k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
-    use_fp8 = k_cache.dtype == torch.float8_e4m3fn
+    use_fp8 = kv_cache_fp8 or k_cache.dtype == torch.float8_e4m3fn
+    if use_fp8 and use_nvfp4:
+        raise ValueError("QSA KV cache cannot be both fp8 and nvfp4")
     if use_nvfp4:
         if k_cache.dtype != torch.uint8:
             raise ValueError("QSA nvfp4 KV cache must be stored as uint8")
@@ -680,8 +698,9 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA nvfp4 data and scale pages disagree in shape")
         if k_scale_cache.stride(3) != 1 or v_scale_cache.stride(3) != 1:
             raise ValueError("QSA nvfp4 block scales must be contiguous per row")
-    elif k_cache.dtype == torch.uint8:
+    elif k_cache.dtype == torch.uint8 and not use_fp8:
         raise ValueError("QSA uint8 K/V cache without block scales is not nvfp4")
+    fp8_via_uint8 = use_fp8 and k_cache.dtype == torch.uint8
     quantized = use_fp8 or use_nvfp4
     if quantized:
         if k_scale is None or v_scale is None:
@@ -815,6 +834,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_QUANT_FP8=use_fp8,
+        FP8_VIA_UINT8=fp8_via_uint8,
         KV_QUANT_NVFP4=use_nvfp4,
         V_SCALE_SWIZZLED=bool(v_scale_swizzled),
         num_warps=partial_warps,
@@ -867,7 +887,9 @@ def warmup_qsa_sparse_paged_attention(
         head_dim = key_cache.shape[-1] * 2
     else:
         key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
-        if kv_cache_fp8:
+        if kv_cache_fp8 and native_fp8_cast_supported():
+            # Same reinterpretation as the production read path; pre-SM89 the
+            # cache stays uint8 and the kernel gets FP8_VIA_UINT8 instead.
             key_cache = key_cache.view(torch.float8_e4m3fn)
             value_cache = value_cache.view(torch.float8_e4m3fn)
     num_kv_heads = key_cache.shape[2]
@@ -1010,6 +1032,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             KV_QUANT_FP8=kv_cache_fp8,
+            FP8_VIA_UINT8=kv_cache_fp8 and not native_fp8_cast_supported(),
             KV_QUANT_NVFP4=kv_cache_nvfp4,
             V_SCALE_SWIZZLED=True,
             num_warps=warps,
