@@ -933,6 +933,8 @@ class MambaSpec(KVCacheSpec):
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
+            and spec.page_size_bytes == self.page_size_bytes
+            and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -1095,9 +1097,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return None
 
     # Helpers for cache formats composed of repeated physical layer tuples.
-    def get_page_sizes(self) -> list[int]:
-        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
-
     def get_num_layer_tuples(self) -> int:
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
@@ -1294,13 +1293,11 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        for group in self.kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                group_spec = group_spec.first_spec
-            if isinstance(group_spec, MambaSpec):
-                return True
-        return False
+        return any(
+            isinstance(spec, MambaSpec)
+            for group in self.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:
