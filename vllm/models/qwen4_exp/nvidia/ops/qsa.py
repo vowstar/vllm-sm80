@@ -878,8 +878,9 @@ def warmup_qsa_sparse_paged_attention(
         for is_prefill in (False, True)
     }
 
-    # Scalars constant per deployment get their real values; the batch-varying
-    # ones use one representative of the divisible-by-16 specialization class.
+    # Scalars constant per deployment get their real values (their divisibility
+    # specialization is wanted); the batch-varying ones are do_not_specialize'd
+    # on the kernels, so any value here compiles the only variant.
     num_rows = 16
     num_requests = 16
     q_ptr = TritonWarmupTensor(
