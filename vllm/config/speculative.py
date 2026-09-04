@@ -1481,15 +1481,26 @@ class SpeculativeConfig:
                                 "dspark_draft_topk must be between 1 and the "
                                 f"draft vocabulary size ({draft_vocab_size})"
                             )
-                        if (
-                            "Qwen3DSparkModel"
-                            not in self.draft_model_config.architectures
-                            and _QWEN3_OMNI_DSPARK_ARCHITECTURE
-                            not in self.draft_model_config.architectures
-                        ):
+                        archs = self.draft_model_config.architectures
+                        is_qwen3_dspark = (
+                            "Qwen3DSparkModel" in archs
+                            or _QWEN3_OMNI_DSPARK_ARCHITECTURE in archs
+                        )
+                        # DeepSeek-V4 DSpark drafts over the full target
+                        # vocabulary, so the gathered top-k path is exact at
+                        # draft TP=1 (shard-local top-k unsupported).
+                        draft_tp = (
+                            self.draft_tensor_parallel_size
+                            or self.target_parallel_config.tensor_parallel_size
+                        )
+                        is_dsv4_dspark_tp1 = (
+                            "DSparkDraftModel" in archs and draft_tp == 1
+                        )
+                        if not (is_qwen3_dspark or is_dsv4_dspark_tp1):
                             raise ValueError(
                                 "dspark_draft_topk is only supported by "
-                                "Qwen3DSparkModel and Qwen3OmniDSparkModel"
+                                "Qwen3DSparkModel, Qwen3OmniDSparkModel, and "
+                                "DeepSeek-V4 DSpark at draft TP=1"
                             )
                         hf_config.dspark_draft_topk = dspark_draft_topk
 
