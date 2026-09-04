@@ -395,6 +395,10 @@ def _warm_qsa_kernels(
             compress_ratio,
             rows,
             block_indices,
+            # Widest case the deployment can produce; the logits row width is
+            # rounded to 64 inside, so every runtime max_seq_len lands in the
+            # same stride-specialization class.
+            max_len,
         )
         # +1: the packed buffer's trailing valid-count column.
         out = torch.zeros((rows, output_width + 1), dtype=torch.int32, device=device)

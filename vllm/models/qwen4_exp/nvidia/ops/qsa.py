@@ -889,15 +889,19 @@ def warmup_qsa_sparse_paged_attention(
     q_ptr = TritonWarmupTensor(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
+    # The fork's TritonWarmupTensor is (dtype, aligned, shape) and derives
+    # contiguous strides from shape; nothing here consumes those strides (the
+    # kernel's stride arguments are the explicit scalars below), so only the
+    # pointer alignment has to match the production views.
     k_cache_ptr = TritonWarmupTensor(
         key_cache.dtype,
+        aligned=key_cache.data_ptr() % 16 == 0,
         shape=tuple(key_cache.shape),
-        strides=tuple(key_cache.stride()),
     )
     v_cache_ptr = TritonWarmupTensor(
         value_cache.dtype,
+        aligned=value_cache.data_ptr() % 16 == 0,
         shape=tuple(value_cache.shape),
-        strides=tuple(value_cache.stride()),
     )
     # On the bf16 path the production wrapper passes the (bf16) query for the
     # compiled-out scale arguments; match that so the warmup compiles the
@@ -910,13 +914,13 @@ def warmup_qsa_sparse_paged_attention(
         assert k_scale_cache is not None and v_scale_cache is not None
         k_sf_ptr = TritonWarmupTensor(
             k_scale_cache.dtype,
+            aligned=k_scale_cache.data_ptr() % 16 == 0,
             shape=tuple(k_scale_cache.shape),
-            strides=tuple(k_scale_cache.stride()),
         )
         v_sf_ptr = TritonWarmupTensor(
             v_scale_cache.dtype,
+            aligned=v_scale_cache.data_ptr() % 16 == 0,
             shape=tuple(v_scale_cache.shape),
-            strides=tuple(v_scale_cache.stride()),
         )
         ks_strides = k_scale_cache.stride()
         vs_strides = v_scale_cache.stride()
@@ -928,8 +932,8 @@ def warmup_qsa_sparse_paged_attention(
     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width + 1))
     block_table_ptr = TritonWarmupTensor(
         block_table.dtype,
+        aligned=block_table.data_ptr() % 16 == 0,
         shape=tuple(block_table.shape),
-        strides=tuple(block_table.stride()),
     )
     token_to_req_ptr = TritonWarmupTensor(torch.int32)
     output_ptr = TritonWarmupTensor(
