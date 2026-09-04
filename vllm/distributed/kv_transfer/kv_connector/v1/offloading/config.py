@@ -54,7 +54,7 @@ def build_offloading_config(
             group_idx=group_idx,
         )
         for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
-        if group.kv_cache_spec.prefix_cacheable
+        if group.kv_cache_spec.participates_in_prefix_caching
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
