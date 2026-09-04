@@ -39,20 +39,25 @@ def mamba_accepted_warmup(model_runner) -> None:
 
 
 def _collect_states(model_runner) -> list:
-    """Every MambaHybrid state object this runner owns."""
-    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybrid
+    """Every model-state object that owns a num_accepted_tokens_gpu buffer.
 
+    Duck-typed on the buffer rather than on a class name. The class is
+    MambaHybridModelState today, but the runner holds exactly one state object
+    under .model_state and a rename upstream must not silently disable this
+    warmup -- an ImportError here is caught and the kernels then JIT in a
+    collective, which is the failure this module exists to prevent.
+    """
     found: list = []
     seen: set[int] = set()
 
     def visit(obj) -> None:
-        if id(obj) in seen:
+        if obj is None or id(obj) in seen:
             return
         seen.add(id(obj))
-        if isinstance(obj, MambaHybrid):
+        if getattr(obj, "num_accepted_tokens_gpu", None) is not None:
             found.append(obj)
 
-    for attr in ("model_states", "req_states", "kv_cache_manager"):
+    for attr in ("model_state", "model_states"):
         holder = getattr(model_runner, attr, None)
         if holder is None:
             continue
@@ -64,8 +69,6 @@ def _collect_states(model_runner) -> list:
                 visit(value)
         else:
             visit(holder)
-            for value in vars(holder).values() if hasattr(holder, "__dict__") else ():
-                visit(value)
     return found
 
 
