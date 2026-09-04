@@ -756,6 +756,40 @@ def resolve_kv_cache_block_sizes(
             f"Got group block sizes={group_block_sizes}, "
             f"participating={hashing_sizes}."
         )
+
+    # A spec that packs several tokens into one stored state can only be
+    # replayed at a boundary that is a whole number of states. The boundary a
+    # cache hit actually lands on is the scheduler block size, except when a
+    # mamba group covers more tokens than one hash block, in which case a hit
+    # can stop at a hash-block boundary inside that group's block.
+    prefix_alignments = {
+        spec.tokens_per_state
+        for group in groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+        if spec.participates_in_prefix_caching
+        and isinstance(spec.tokens_per_state, int)
+        and spec.tokens_per_state > 1
+    }
+    has_partial_mamba_group = any(
+        isinstance(spec, MambaSpec)
+        and spec.mamba_cache_mode == "align"
+        and (
+            (dcp == 1 and block_size > hash_block_size)
+            or (dcp > 1 and block_size >= hash_block_size)
+        )
+        for group, block_size in zip(groups, group_block_sizes)
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    )
+    cache_hit_alignment = (
+        hash_block_size if has_partial_mamba_group else scheduler_block_size
+    )
+    if any(cache_hit_alignment % alignment for alignment in prefix_alignments):
+        raise ValueError(
+            f"Invalid prefix_match_unit={hash_block_size}; prefix-cache "
+            "boundaries must align with each spec's per-state compression. "
+            f"Got cache_hit_alignment={cache_hit_alignment} and "
+            f"alignments={sorted(prefix_alignments)}."
+        )
     return scheduler_block_size, hash_block_size
 
 
