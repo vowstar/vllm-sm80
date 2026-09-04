@@ -34,6 +34,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
+from vllm.model_executor.warmup.mamba_accepted_warmup import (
+    mamba_accepted_warmup,
+)
 from vllm.model_executor.warmup.post_update_warmup import post_update_warmup
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
@@ -141,6 +144,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         )
 
     post_update_warmup(worker.model_runner)
+
+    mamba_accepted_warmup(worker.model_runner)
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
