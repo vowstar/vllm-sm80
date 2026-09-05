@@ -386,7 +386,10 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
                         with torch.cuda.graph(
-                            graph, self.pool, stream=current_stream()
+                            graph,
+                            self.pool,
+                            stream=current_stream(),
+                            capture_error_mode="thread_local",
                         ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid

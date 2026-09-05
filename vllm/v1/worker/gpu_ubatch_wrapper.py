@@ -288,6 +288,7 @@ class UBatchWrapper:
                 cudagraph_metadata.cudagraph,
                 stream=compute_stream,
                 pool=self.graph_pool,
+                capture_error_mode="thread_local",
             ):
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:

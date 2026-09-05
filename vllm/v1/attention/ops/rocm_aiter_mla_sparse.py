@@ -526,10 +526,20 @@ def fp8_paged_mqa_logits_torch(
             logits[i, :seq_len] = score[:seq_len]
         return logits
 
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
-    scale = scale.contiguous().view(torch.float)
+    # The cache block layout is planar (matching `indexer_k_quant_and_cache`):
+    # all `block_size * dim` fp8 K bytes first, then `block_size` fp32 scales.
+    # The nominal `[..., dim + 4]` shape is a stride trick -- slicing it
+    # token-interleaved (as this branch used to) reads K shifted by 4 bytes
+    # per token and bitcasts neighbouring value bytes as scales.
+    num_block, block_size = kv_cache.shape[0], kv_cache.shape[1]
+    kv_flat = kv_cache.reshape(num_block, -1)
+    k_end = block_size * dim
+    value = kv_flat[..., :k_end].contiguous().view(fp8_dtype).float()
+    scale = kv_flat[..., k_end:].contiguous().view(torch.float)
     q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
+    kv_cache = value.view(num_block, block_size, 1, dim) * scale.view(
+        num_block, block_size, 1, 1
+    )
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],

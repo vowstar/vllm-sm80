@@ -176,9 +176,9 @@ class BreakableCUDAGraphCapture:
         assert not self._capturing
         g = torch.cuda.CUDAGraph()
         if self.pool is not None:
-            g.capture_begin(pool=self.pool)
+            g.capture_begin(pool=self.pool, capture_error_mode="thread_local")
         else:
-            g.capture_begin()
+            g.capture_begin(capture_error_mode="thread_local")
         self._current_graph = g
         self._capturing = True
 
