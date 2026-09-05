@@ -115,17 +115,40 @@ it sizes the cache.
 | --- | ---: | ---: | ---: |
 | Checkpoint on disk | 156 GiB | 173 GiB | 183 GiB |
 | Parameters | 305 B, about 16 B active | 180 B, 51 B of it the PLE table, about 10 B active | 320 B, 18 B active |
-| Cards, pipeline stages | 4, PP4 | 4, PP4 | 5, PP5 |
-| Weights per card | 41.2 GiB | About 55 GiB | About 49 to 64 GiB |
-| KV pool | 2,655,371 tokens | 2,885,563 tokens | 6,670,108 tokens |
-| Concurrency at 1 M context | 2.53x | 2.89x | 6.36x |
+| Cards, pipeline stages | 4, PP4 | 5, PP5 | 5, PP5 |
+| Weights per card | 41.2 GiB | About 25 GiB | About 49 to 64 GiB |
+| KV pool | 2,655,371 tokens | 7,244,396 tokens | 6,670,108 tokens |
+| Concurrency at 1 M context | 2.53x | 6.91x | 6.36x |
 | Cold start to serving | 4 minutes from NVMe | 35 minutes from spinning disks | 4 minutes from NVMe |
 
 The Qwen cold start is dominated by reading 173 GiB of weights, 51 GB of it
 the PLE table, off spinning disks. The same model on NVMe would not take that long.
 GLM holds a much larger KV pool because its 34 KDA layers store a fixed size
 recurrent state instead of a growing cache, and because its launcher pins
-`--kv-cache-memory` at 12.5 GiB per rank.
+`--kv-cache-memory` at 12.5 GiB per rank. Qwen reaches its pool with
+`--kv-cache-memory` pinned at 29 GiB per rank plus a 150 GiB CPU offload tier
+(the native connector, ported from upstream #54743 and #55033); its util-derived
+pool is only 5.66 M tokens.
+
+### Multi-prefix cache residency (Qwen)
+
+Independent 200 K-token prefixes, filled then replayed, PP5, bfloat16 KV. A
+prefix counts as resident when the replay reports at least 95 percent cached
+prompt tokens.
+
+| Configuration | Resident prefixes | What happens past the limit |
+| --- | ---: | --- |
+| util-derived pool (5.66 M tokens) | 3 | the 4th replay collapses to 0 cached tokens |
+| pin 29 GiB/rank + 150 GiB CPU offload (7.24 M tokens) | 4 | the 5th degrades gracefully to 86 percent, no cascade |
+
+Single-prefix replay quality improved at the same time: a 200 K prefix went
+from 86.01 percent cached (172,032 tokens, 4.1 s probe) to 99.97 percent
+(199,936 tokens, 1.35 s probe), and mean TTFT in a 3x200K mix dropped from
+6.99 s to 3.72 s. Decode speed is unchanged by the pin and the offload tier
+(99.68 vs 100.45 tok/s aggregate at 3x200K, inside run-to-run noise). An fp8
+QSA KV cache was also measured: it grows the pool 1.82x but makes cold
+prefill about 9x slower and buys only about 33 percent more residency, so
+production stays on bfloat16 KV.
 
 ### Throughput against concurrency
 
