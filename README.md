@@ -10,7 +10,7 @@ driver 610.43.02. Other sm_80 GPUs such as A100 are not tested.
 
 | Model | State | Tested layout |
 | --- | --- | --- |
-| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 or 5 cards, PP4 or PP5, 1M context, vision, DSpark x3, fp8 KV |
+| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 or 5 cards, PP4 or PP5, 1M context, vision, DSpark x3, fp8_ds_mla KV, split-K decode |
 | Qwen3.8-Flash-Next-FP8 | Serving, measured | 4 cards, PP4, 1M YaRN context, PLE CPU offload |
 | GLM-5.3-Flash | Serving, measured | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
 
@@ -60,27 +60,24 @@ prefill.
 
 | Prompt tokens | DeepSeek tok/s | Qwen tok/s | GLM tok/s |
 | ---: | ---: | ---: | ---: |
-| About 2 K | 75.8 | 53.3 | 68.7 |
-| About 7 K | 66.4 | 51.4 | 60.8 |
-| About 30 K | 77.9 | 52.3 | 64.3 |
-| About 90 K | 58.2 | 52.0 | 62.7 |
-| About 230 K | 58.5 | 53.0 | 62.5 |
-| About 460 K | 48.2 | 55.1 | 54.0 |
-| About 900 K to 1 M | 26.0 | 54.1 | 68.3 |
+| About 2 K | 85.2 | 53.3 | 68.7 |
+| About 7 K | 71.7 | 51.4 | 60.8 |
+| About 30 K | 73.9 | 52.3 | 64.3 |
+| About 90 K | 70.4 | 52.0 | 62.7 |
+| About 230 K | 83.8 | 53.0 | 62.5 |
+| About 460 K | 73.6 | 55.1 | 54.0 |
+| About 900 K to 1 M | 67.7 | 54.1 | 68.3 |
 
 Read the three columns as three attention designs, not as a ranking.
 
 Qwen holds one decode rate at every length because its GDN linear attention
 keeps a constant size recurrent state. GLM is also close to flat because only
 11 of its 45 layers are sparse MLA and the other 34 are KDA linear attention.
-DeepSeek is the only one that falls away, because its sparse indexer scores
-every position in the cache on every step and its DSpark acceptance drops with
-context.
-
-The crossovers matter more than the peaks. DeepSeek leads GLM up to about
-30 K and trails it after that. DeepSeek leads Qwen up to somewhere between
-230 K and 460 K, and past that Qwen is both faster to decode and several times
-faster to prefill.
+DeepSeek used to be the one that fell away at long context; after the split-K
+sparse decode merge (ported from
+[wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport), see the
+DeepSeek section below) its curve is nearly flat too, 68 to 85 tok/s from 2 K
+to 850 K, and it leads the other two at almost every length measured.
 
 Two caveats on this table. Only DeepSeek and GLM run speculative decoding, so
 part of their short context advantage is draft acceptance rather than step
@@ -94,12 +91,12 @@ Time to first token on the same runs, with the rate it implies.
 
 | Prompt tokens | DeepSeek | Qwen | GLM |
 | ---: | ---: | ---: | ---: |
-| About 2 K | 0.9 s, 2,163 tok/s | 0.5 s, 4,102 tok/s | 1.2 s, 1,439 tok/s |
-| About 30 K | 5.8 s, 5,225 tok/s | 2.9 s, 10,267 tok/s | 8.8 s, 3,089 tok/s |
-| About 90 K | 17.9 s, 5,146 tok/s | 6.2 s, 14,499 tok/s | 20.9 s, 3,973 tok/s |
-| About 230 K | 53.1 s, 4,336 tok/s | 15.3 s, 14,670 tok/s | 49.1 s, 4,216 tok/s |
-| About 460 K | 138.0 s, 3,334 tok/s | 33.9 s, 13,277 tok/s | 102.1 s, 4,055 tok/s |
-| About 900 K to 1 M | 406.7 s, 2,262 tok/s | 82.9 s, 10,751 tok/s | 289.0 s, 3,177 tok/s |
+| About 2 K | 0.9 s, 2,166 tok/s | 0.5 s, 4,102 tok/s | 1.2 s, 1,439 tok/s |
+| About 30 K | 5.7 s, 5,333 tok/s | 2.9 s, 10,267 tok/s | 8.8 s, 3,089 tok/s |
+| About 90 K | 23.3 s, 5,177 tok/s | 6.2 s, 14,499 tok/s | 20.9 s, 3,973 tok/s |
+| About 230 K | 55.4 s, 4,352 tok/s | 15.3 s, 14,670 tok/s | 49.1 s, 4,216 tok/s |
+| About 460 K | 167.6 s, 2,878 tok/s | 33.9 s, 13,277 tok/s | 102.1 s, 4,055 tok/s |
+| About 900 K to 1 M | 349.9 s, 2,235 tok/s | 82.9 s, 10,751 tok/s | 289.0 s, 3,177 tok/s |
 
 Qwen prefills two to four times faster than DeepSeek at every length and holds
 its rate, while DeepSeek peaks near 30 K and then halves. GLM peaks near
@@ -117,8 +114,8 @@ it sizes the cache.
 | Parameters | 305 B, about 16 B active | 180 B, 51 B of it the PLE table, about 10 B active | 320 B, 18 B active |
 | Cards, pipeline stages | 4, PP4 | 5, PP5 | 5, PP5 |
 | Weights per card | 41.2 GiB | About 25 GiB | About 49 to 64 GiB |
-| KV pool | 2,655,371 tokens | 7,244,396 tokens | 6,670,108 tokens |
-| Concurrency at 1 M context | 2.53x | 6.91x | 6.36x |
+| KV pool | 2,674,615 tokens | 7,244,396 tokens | 6,670,108 tokens |
+| Concurrency at 1 M context | 2.55x | 6.91x | 6.36x |
 | Cold start to serving | 4 minutes from NVMe | 35 minutes from spinning disks | 4 minutes from NVMe |
 
 The Qwen cold start is dominated by reading 173 GiB of weights, 51 GB of it
@@ -160,15 +157,15 @@ service:
 
 | Concurrency | Qwen aggregate | Qwen steady | GLM aggregate | DeepSeek aggregate |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 39.7 tok/s | 39.6 tok/s | 63.8 tok/s | 69.2 tok/s |
-| 4 | 131.3 tok/s | 142.4 tok/s | 153.0 tok/s | 179.8 tok/s |
-| 8 | 221.9 tok/s | 252.8 tok/s | 188.3 tok/s | 215.2 tok/s |
-| 16 | 375.5 tok/s | 432.5 tok/s | 309.1 tok/s | 334.9 tok/s |
-| 32 | 506.0 tok/s | 644.3 tok/s | 432.8 tok/s | 426.6 tok/s |
+| 1 | 39.7 tok/s | 39.6 tok/s | 63.8 tok/s | 76.1 tok/s |
+| 4 | 131.3 tok/s | 142.4 tok/s | 153.0 tok/s | 180.8 tok/s |
+| 8 | 221.9 tok/s | 252.8 tok/s | 188.3 tok/s | 253.9 tok/s |
+| 16 | 375.5 tok/s | 432.5 tok/s | 309.1 tok/s | 344.7 tok/s |
+| 32 | 506.0 tok/s | 644.3 tok/s | 432.8 tok/s | 420.3 tok/s |
 
 Per-request median at the same points: Qwen 39.7 / 32.8 / 27.8 / 23.5 / 15.8,
-GLM 63.8 / 39.0 / 23.9 / 20.0 / 14.0, DeepSeek 80.3 / 49.9 / 29.9 / 23.3 /
-14.0 tok/s. Qwen is slowest single-stream because it is the only one without
+GLM 63.8 / 39.0 / 23.9 / 20.0 / 14.0, DeepSeek 78.1 / 61.6 / 40.3 / 28.3 /
+14.9 tok/s. Qwen is slowest single-stream because it is the only one without
 speculative decoding, but scales best (12.7x from 1 to 32 streams) because its
 GDN linear attention batches cheaply; GLM and DeepSeek scale about 6.5x.
 
@@ -246,6 +243,7 @@ Main changes for this model:
 | Pipeline parallelism | Carries vision metadata across PP ranks and adds the DSpark PP path. |
 | Prefix caching | Keeps the deepest EAGLE reachable boundary for sparse sliding window groups. |
 | Metrics | Caps speculative acceptance at the number of drafts a grammar left valid. |
+| Sparse decode | Ports the split-K sparse decode kernels, fp8 LUT dequantization, deterministic CUDA top-k, prefill tiling, and the fp8_ds_mla planar layout fix from [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) (branch `wtd-merge-20260905`). The long context decode curve is nearly flat after this, 68 to 85 tok/s from 2 K to 850 K. Their blocked prefill kernel is present but gated off by default; its first live run hung the engine and the current hypothesis is first-use Triton JIT stalling a pipeline collective. |
 
 ## Qwen3.8-Flash-Next
 
@@ -328,13 +326,14 @@ docker run -d --name vllm --runtime=nvidia \
   -e VLLM_PP_LAYER_PARTITION=12,12,12,7 \
   -e VLLM_MARLIN_FP8_DEQUANT_BF16=1 \
   -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096 \
+  -e VLLM_DSV4_DECODE_FP8_LUT=1 \
   -e DSV4_LOGITS_ROW_CHUNK=64 \
   -e HF_HUB_OFFLINE=1 \
   -v /path/to/DeepSeek-V4-Flash-Vision-Exp:/model:ro \
   --shm-size=16g -p 8098:8000 \
   vllm-sm80:latest vllm serve /model \
   --served-model-name DeepSeek-V4-Flash-Vision-Exp \
-  --pipeline-parallel-size 4 --kv-cache-dtype fp8 \
+  --pipeline-parallel-size 4 --kv-cache-dtype fp8_ds_mla \
   --block-size 256 --max-model-len 1048576 \
   --max-num-batched-tokens 2048 --max-num-seqs 128 \
   --gpu-memory-utilization 0.85 --trust-remote-code \
