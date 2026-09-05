@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_DENSE_QUERY_BLOCK: int = -1
+    VLLM_DSV4_SPLIT_K_DECODE: bool = True
+    VLLM_DSV4_DECODE_FP8_LUT: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1085,6 +1087,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-query kernel, >0 forces the tile.
     "VLLM_SPARSE_DENSE_QUERY_BLOCK": lambda: int(
         os.environ.get("VLLM_SPARSE_DENSE_QUERY_BLOCK", "-1")
+    ),
+    # Route DSv4 sparse-attention decode through the split-K (flash-decode)
+    # kernels on CUDA instead of the single-pass fallback. The single-pass
+    # grid is num_queries x head_blocks, which under-fills the device in the
+    # low-concurrency regime that dominates latency. Default on (the wtdcode
+    # fork's production configuration on Ampere); 0 keeps the fallback for A/B.
+    "VLLM_DSV4_SPLIT_K_DECODE": lambda: (
+        os.environ.get("VLLM_DSV4_SPLIT_K_DECODE", "1") == "1"
+    ),
+    # Decode fp8 KV bytes through the cached 256-entry bf16 lookup table
+    # instead of the in-register ALU decode (_decode_fp8_f32) in the DSv4
+    # sparse decode kernels. Default off: on this GPU model the ALU form
+    # measured faster in a different kernel family's shootout; set 1 to A/B
+    # the LUT in these kernels.
+    "VLLM_DSV4_DECODE_FP8_LUT": lambda: (
+        os.environ.get("VLLM_DSV4_DECODE_FP8_LUT", "0") == "1"
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

@@ -15,7 +15,11 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+from vllm.v1.attention.ops.fp8_sm80 import (
+    _decode_fp8_f32,
+    _decode_fp8_lut,
+    get_e4m3fn_bf16_lut,
+)
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -1680,6 +1684,7 @@ def _sparse_attn_decode_ragged_kernel(
     extra_indices_ptr,
     extra_indptr_ptr,
     attn_sink_ptr,
+    fp8_lut_ptr,
     out_ptr,
     q_stride0,
     q_stride1,
@@ -1704,6 +1709,7 @@ def _sparse_attn_decode_ragged_kernel(
     IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_FP8_LUT: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -1758,7 +1764,10 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+        if USE_FP8_LUT:
+            x_f32 = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr).to(tl.float32)
+        else:
+            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
@@ -1823,7 +1832,12 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+            if USE_FP8_LUT:
+                x_f32 = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr).to(
+                    tl.float32
+                )
+            else:
+                x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
@@ -1912,6 +1926,7 @@ def _sparse_attn_decode_partial_kernel(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
+    fp8_lut_ptr,
     q_stride0,
     q_stride1,
     main_cache_stride0,
@@ -1941,6 +1956,7 @@ def _sparse_attn_decode_partial_kernel(
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    USE_FP8_LUT: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     split_id = tl.program_id(1)
@@ -2002,7 +2018,10 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+        if USE_FP8_LUT:
+            x_f32 = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr).to(tl.float32)
+        else:
+            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
@@ -2070,7 +2089,12 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+            if USE_FP8_LUT:
+                x_f32 = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr).to(
+                    tl.float32
+                )
+            else:
+                x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
@@ -2751,6 +2775,23 @@ def _rocm_sparse_attn_prefill_triton(
 
 
 @functools.lru_cache
+def _use_split_k_decode() -> bool:
+    """Whether decode takes the split-K path instead of the single-pass one.
+
+    Split-K exists for the low-batch regime: the single-pass grid is
+    ``num_queries x heads_blocks``, so a single-query decode occupies a
+    handful of the device's SMs. The split-count heuristic reads the real
+    CU/SM count, so it adapts off gfx950 even though ``mu`` was tuned there.
+    On CUDA the path is on by default (the wtdcode fork's production
+    configuration on Ampere); VLLM_DSV4_SPLIT_K_DECODE=0 keeps the
+    single-pass fallback for A/B.
+    """
+    if current_platform.is_cuda():
+        return envs.VLLM_DSV4_SPLIT_K_DECODE
+    return _ON_GFX942 or _ON_GFX950
+
+
+@functools.lru_cache
 def _decode_cu_count() -> int:
     try:
         return torch.cuda.get_device_properties(0).multi_processor_count
@@ -2982,8 +3023,12 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    # Cached 512-byte table; only read by the kernels when USE_FP8_LUT is set
+    # (compile-time), so q doubles as the unused placeholder otherwise.
+    use_fp8_lut = envs.VLLM_DSV4_DECODE_FP8_LUT
+    fp8_lut = get_e4m3fn_bf16_lut(q.device) if use_fp8_lut else q
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    if not _use_split_k_decode():  # Single-pass fallback for un-tuned archs.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2994,6 +3039,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             extra_indices,
             extra_indptr,
             attn_sink,
+            fp8_lut,
             out,
             q.stride(0),
             q.stride(1),
@@ -3016,6 +3062,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             IS_FNUZ_EXTRA=False,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
+            USE_FP8_LUT=use_fp8_lut,
             num_warps=8,
         )
         return out
@@ -3113,6 +3160,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             part_m,
             part_l,
             part_acc,
+            fp8_lut,
             q.stride(0),
             q.stride(1),
             main_cache.stride(0),
@@ -3142,6 +3190,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
+            USE_FP8_LUT=use_fp8_lut,
             num_warps=4,
         )
 
