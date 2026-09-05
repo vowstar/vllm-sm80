@@ -1297,6 +1297,84 @@ def _validate_dsv4_sparse_dims(
     )
 
 
+# Largest row count the one-block exclusive scan handles: the scan covers
+# `rows` lanes (not rows+1 -- slot 0 is stored flat), so 8192 int32 lanes is
+# 32 KB of accumulator across 8 warps.
+#
+# 8192 is not a round number chosen for headroom, it is the production shape:
+# an 8K prefill hands this exactly 8192 rows. The previous cap of 8191 -- one
+# short -- dropped every prefill layer onto the torch fallback below, whose
+# `indptr[0] = 0` is a synchronous pageable H2D that stalls the host and
+# serialises the whole ragged-prep chain behind it. Lowering this below 8192
+# reintroduces ~5.7 ms of GPU idle per 8K prefill.
+_MAX_ONE_BLOCK_INDPTR_ROWS = 8192
+
+
+@triton.jit
+def _lengths_to_indptr_kernel(
+    indptr_ptr,
+    lengths_ptr,
+    num_rows,
+    BLOCK: tl.constexpr,
+):
+    """indptr[i] = sum(lengths[:i]) for i in [0, num_rows], in one launch."""
+    offsets = tl.arange(0, BLOCK)
+    # The scan covers `num_rows` lanes and writes indptr[1:]; slot 0 is a
+    # constant stored alongside. Scanning rows rather than rows+1 is what keeps
+    # a power-of-two row count inside one block of the same width -- shifting
+    # the load instead would need next_power_of_2(rows + 1), i.e. 16384 lanes
+    # for the 8192-row prefill, which is what the old cap was avoiding.
+    vals = tl.load(lengths_ptr + offsets, mask=offsets < num_rows, other=0).to(tl.int32)
+    tl.store(indptr_ptr + offsets + 1, tl.cumsum(vals, axis=0), mask=offsets < num_rows)
+    tl.store(indptr_ptr + offsets, 0, mask=offsets == 0)
+
+
+def lengths_to_indptr(
+    lengths: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Exclusive prefix sum of ``lengths``, as an int32 ``[n + 1]`` indptr.
+
+    One Triton launch instead of the ``torch.zeros`` + ``torch.cumsum`` pair
+    (a fill, a cub scan-init and a cub scan kernel = 3 cudagraph nodes). The
+    ragged sparse-attention metadata rebuilds this per indexer layer per step,
+    so the two deleted nodes are paid 21x every decode step. Integer sums, so
+    the result is bit-identical to the torch path.
+
+    ``out`` writes the result into caller-owned storage -- used to build
+    straight into a persistent cudagraph buffer instead of allocating and
+    copying afterwards.
+    """
+    lengths = lengths.to(dtype=torch.int32).contiguous()
+    num_rows = lengths.shape[0]
+    if out is None:
+        indptr = torch.empty(num_rows + 1, dtype=torch.int32, device=lengths.device)
+    else:
+        assert out.shape == (num_rows + 1,) and out.dtype == torch.int32, (
+            f"indptr out must be int32 [{num_rows + 1}], got "
+            f"{out.dtype} {tuple(out.shape)}"
+        )
+        # The kernel stores at `out + offsets`, so a strided view would be
+        # written at the wrong addresses rather than failing loudly.
+        assert out.is_contiguous(), "indptr out must be contiguous"
+        indptr = out
+    if num_rows > _MAX_ONE_BLOCK_INDPTR_ROWS:
+        # `indptr[0] = 0` assigns a Python scalar into device memory, which
+        # is a *pageable* H2D copy: it blocks the host, so the cub scan and
+        # everything queued behind it cannot be enqueued while it drains.
+        # zero_() is a device-side fill with no host round-trip.
+        indptr[:1].zero_()
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
+        return indptr
+    _lengths_to_indptr_kernel[(1,)](
+        indptr,
+        lengths,
+        num_rows,
+        BLOCK=triton.next_power_of_2(max(num_rows, 1)),
+        num_warps=8,
+    )
+    return indptr
+
+
 @triton.jit
 def _pack_dense_prefix_to_ragged_kernel(
     indices_ptr,
@@ -1334,7 +1412,18 @@ def build_ragged_indices_from_dense(
     indices: torch.Tensor,
     lengths: torch.Tensor,
     num_rows: int = -1,
+    indices_out: torch.Tensor | None = None,
+    indptr_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten dense per-row prefixes into ragged (indices, indptr).
+
+    ``indices_out`` / ``indptr_out`` are optional destinations: the kernels
+    write there instead of into freshly allocated tensors, which is how the
+    metadata builders fill their persistent cudagraph buffers without a
+    follow-up device-to-device copy. Only the first ``rows * max_width``
+    entries of ``indices_out`` are written; the returned view is the caller's
+    buffer unchanged, and ``indptr`` bounds every downstream read anyway.
+    """
     indices = indices.reshape(indices.shape[0], -1)
     lengths = lengths.to(device=indices.device, dtype=torch.int32).reshape(-1)
     assert lengths.numel() == indices.shape[0], (
@@ -1344,18 +1433,21 @@ def build_ragged_indices_from_dense(
     max_width = indices.shape[1] if indices.ndim == 2 else 0
     lengths = lengths.clamp(min=0, max=max_width).contiguous()
 
-    indptr = torch.zeros(indices.shape[0] + 1, dtype=torch.int32, device=indices.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    indptr = lengths_to_indptr(lengths, out=indptr_out)
 
+    needed = indices.shape[0] * max_width
     if indices.numel() == 0:
         flat = torch.empty(0, dtype=torch.int32, device=indices.device)
     else:
-        flat = torch.empty(
-            indices.shape[0] * max_width,
-            dtype=torch.int32,
-            device=indices.device,
-        )
-        if flat.numel() > 0:
+        if indices_out is None:
+            flat = torch.empty(needed, dtype=torch.int32, device=indices.device)
+        else:
+            assert indices_out.dtype == torch.int32, "ragged out must be int32"
+            assert indices_out.numel() >= needed, (
+                f"ragged out holds {indices_out.numel()} entries, need {needed}"
+            )
+            flat = indices_out
+        if needed > 0:
             block_size = 128
             _pack_dense_prefix_to_ragged_kernel[
                 (indices.shape[0], triton.cdiv(max_width, block_size))
