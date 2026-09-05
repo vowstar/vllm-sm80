@@ -255,69 +255,127 @@ __device__ bool processHistogramStep(
   // The threshold bin.
   thresholdBinIdx = smemThresholdBinIdx[0];
 
-  auto processBins = [&](float logit, int idx) {
-    if (isPartialMatch<patternShift>(logit, logitPattern)) {
-      uint32_t binIdx = extractBinIdx<step>(logit);
-      // Only write elements with binIdx < thresholdBinIdx when:
-      // 1. This is step 0 and the threshold bin is small enough (no step 1)
-      // 2. This is step >= 1 (where pattern matching filters correctly)
-      // This prevents duplicates when step 0 and step 1 both run.
-      bool shouldWriteDirectly =
-          (step == 0 && smemFinalBinSize[0] <= kNumFinalItems) || (step >= 1);
-      if (binIdx < thresholdBinIdx && shouldWriteDirectly) {
-        // The element is part of the top-k selection
-        int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
+  // Deterministic claim sweep. The historical version claimed output and
+  // tie-buffer slots with first-come-first-served atomicAdds, so the output
+  // order (and, at step 3, the selected set among 32-bit-identical logits)
+  // depended on warp scheduling — the source of temp=0 non-determinism in
+  // the DSv4 sparse indexer (#50576). Here every iteration covers a
+  // contiguous index span; a packed block prefix scan assigns each selected
+  // element a stable position in ascending index order.
+  __shared__ uint32_t sweepWarpSums[kNumThreadsPerBlock / 32];
+  const int foundBase = smemFoundTopKValues[0];
+  const int dstBase = smemFinalDstIdx[0];
+  const bool binFits = smemFinalBinSize[0] <= kNumFinalItems;
+  int eqBase = 0;
+  if constexpr (step == 3) {
+    // Prefix value at the threshold bin: count of all higher-value selections.
+    // The elements in the threshold bin share the same 32 bits at step 3, so
+    // "the first (topK - eqBase) of them in index order" is the deterministic
+    // tie-break.
+    eqBase = smemFinal.histo.data[thresholdBinIdx];
+  }
+  const uint32_t sweepLane = threadIdx.x % 32;
+  const uint32_t sweepWarp = threadIdx.x / 32;
+  const int rowLen = rowEnd - rowStart;
+  int defRun = 0, tieRun = 0;
 
-        if constexpr (mergeBlocks) {
-          smemOutput[dstIdx] = indices[idx];
-        } else if constexpr (multipleBlocksPerRow) {
-          smemOutput[dstIdx] = idx + rowStart;
-          reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
-        } else {
-          smemOutput[dstIdx] = idx;
-        }
-      }
-      if constexpr (step < 3) {
-        // Only fill the final items for sorting if the threshold bin fits
-        if (binIdx == thresholdBinIdx &&
-            smemFinalBinSize[0] <= kNumFinalItems) {
-          int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
-          smemFinal.items.logits[dstIdx] = logit;
-          if constexpr (mergeBlocks) {
-            smemFinal.items.indices[dstIdx] = indices[idx];
-          } else if constexpr (multipleBlocksPerRow) {
-            smemFinal.items.indices[dstIdx] = idx + rowStart;
-          } else {
-            smemFinal.items.indices[dstIdx] = idx;
-          }
-        }
+  for (int chunk = 0; chunk < rowLen; chunk += kNumThreadsPerBlock) {
+    const int rowIt = chunk + static_cast<int>(threadIdx.x);
+    bool isDef = false, isTie = false;
+    float logit = 0.0f;
+    int procIdx = 0;
+    if (rowIt < rowLen) {
+      if (stride1 == 1) {
+        procIdx = rowIt;  // local index, matching vectorized_process
+        logit = logits[rowStart + rowIt];
       } else {
-        if (binIdx == thresholdBinIdx) {
-          // The elements in the threshold bin share the same 32 bits at step 3
-          int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
-          if (dstIdx < topK) {
-            if constexpr (mergeBlocks) {
-              smemOutput[dstIdx] = indices[idx];
-            } else if constexpr (multipleBlocksPerRow) {
-              smemOutput[dstIdx] = idx + rowStart;
-              reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
-            } else {
-              smemOutput[dstIdx] = idx;
-            }
+        procIdx = rowStart + rowIt;
+        logit = logits[procIdx * stride1];
+      }
+      if (isPartialMatch<patternShift>(logit, logitPattern)) {
+        uint32_t binIdx = extractBinIdx<step>(logit);
+        // Only write elements with binIdx < thresholdBinIdx when:
+        // 1. This is step 0 and the threshold bin is small enough (no step 1)
+        // 2. This is step >= 1 (where pattern matching filters correctly)
+        // This prevents duplicates when step 0 and step 1 both run.
+        const bool shouldWriteDirectly = (step == 0 && binFits) || (step >= 1);
+        if (binIdx < thresholdBinIdx && shouldWriteDirectly) {
+          isDef = true;
+        } else if (binIdx == thresholdBinIdx) {
+          if constexpr (step < 3) {
+            isTie = binFits;
+          } else {
+            isTie = true;
           }
         }
       }
     }
-  };
 
-  if (stride1 == 1) {
-    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart,
-                       rowEnd - rowStart, processBins);
-  } else {
-    for (int idx = rowStart + threadIdx.x; idx < rowEnd;
-         idx += kNumThreadsPerBlock) {
-      float logit = logits[idx * stride1];
-      processBins(logit, idx);
+    const uint32_t packed = (isDef ? 0x10000u : 0u) | (isTie ? 1u : 0u);
+    uint32_t winc = packed;
+#pragma unroll
+    for (uint32_t o = 1; o < 32; o *= 2) {
+      const uint32_t n = __shfl_up_sync(0xFFFFFFFF, winc, o);
+      if (sweepLane >= o) winc += n;
+    }
+    if (sweepLane == 31) sweepWarpSums[sweepWarp] = winc;
+    __syncthreads();
+
+    uint32_t interPrefix = 0, iterTotal = 0;
+#pragma unroll
+    for (uint32_t w = 0; w < kNumThreadsPerBlock / 32; ++w) {
+      const uint32_t ws = sweepWarpSums[w];
+      if (w < sweepWarp) interPrefix += ws;
+      iterTotal += ws;
+    }
+    const uint32_t threadExcl = interPrefix + (winc - packed);
+
+    if (isDef) {
+      const int dstIdx = foundBase + defRun + static_cast<int>(threadExcl >> 16);
+      if constexpr (mergeBlocks) {
+        smemOutput[dstIdx] = indices[procIdx];
+      } else if constexpr (multipleBlocksPerRow) {
+        smemOutput[dstIdx] = procIdx + rowStart;
+        reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
+      } else {
+        smemOutput[dstIdx] = procIdx;
+      }
+    } else if (isTie) {
+      const int tieRank = tieRun + static_cast<int>(threadExcl & 0xFFFF);
+      if constexpr (step < 3) {
+        const int dstIdx = dstBase + tieRank;
+        smemFinal.items.logits[dstIdx] = logit;
+        if constexpr (mergeBlocks) {
+          smemFinal.items.indices[dstIdx] = indices[procIdx];
+        } else if constexpr (multipleBlocksPerRow) {
+          smemFinal.items.indices[dstIdx] = procIdx + rowStart;
+        } else {
+          smemFinal.items.indices[dstIdx] = procIdx;
+        }
+      } else {
+        const int dstIdx = eqBase + tieRank;
+        if (dstIdx < topK) {
+          if constexpr (mergeBlocks) {
+            smemOutput[dstIdx] = indices[procIdx];
+          } else if constexpr (multipleBlocksPerRow) {
+            smemOutput[dstIdx] = procIdx + rowStart;
+            reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
+          } else {
+            smemOutput[dstIdx] = procIdx;
+          }
+        }
+      }
+    }
+
+    defRun += static_cast<int>(iterTotal >> 16);
+    tieRun += static_cast<int>(iterTotal & 0xFFFF);
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    smemFoundTopKValues[0] = foundBase + defRun;
+    if constexpr (step < 3) {
+      smemFinalDstIdx[0] = dstBase + tieRun;
     }
   }
 
@@ -512,7 +570,11 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
         auto logit = smemFinal.items.logits[i];
         for (int j = 0; j < smemFinalDstIdx[0]; j++) {
           auto otherLogit = smemFinal.items.logits[j];
-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+          // Ties rank by ascending buffer position (== ascending index, the
+          // deterministic claim sweep fills the buffer in index order), so
+          // the cut keeps the smallest indices — same tie-break as the other
+          // top-k paths and the (value desc, index asc) contract.
+          if (logit < otherLogit || (logit == otherLogit && j < i)) {
             outIndex++;
           }
         }

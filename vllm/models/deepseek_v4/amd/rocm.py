@@ -34,11 +34,14 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    build_query_blocks,
     build_ragged_indices_from_dense,
     lengths_to_indptr,
+    prefill_query_block_size,
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_prefill_blocked,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -405,6 +408,10 @@ class _PrefillChunkSlices:
     query_start_loc: torch.Tensor
     compressed_seq_lens: torch.Tensor | None
     compressed_block_table: torch.Tensor | None
+    # Query-block layout for the ratio-128 blocked prefill path; built only
+    # when the caller resolved a nonzero tile (text-only steps).
+    block_req: torch.Tensor | None = None
+    block_qstart: torch.Tensor | None = None
 
 
 @dataclass
@@ -929,6 +936,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         self,
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        block_m: int = 0,
     ) -> list[_PrefillChunkSlices]:
         cache_key = (
             _LAYER_TYPE_SWAONLY
@@ -961,6 +969,16 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 chunk_start + self.PREFILL_CHUNK_SIZE, swa_metadata.num_prefills
             )
             chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+            chunk_query_start_loc = query_start_loc[
+                num_decodes + chunk_start : num_decodes + chunk_end + 1
+            ]
+            block_req = block_qstart = None
+            if block_m > 0:
+                block_req, block_qstart = build_query_blocks(
+                    chunk_query_start_loc,
+                    block_m,
+                    query_start_loc.device,
+                )
             chunks.append(
                 _PrefillChunkSlices(
                     chunk_size=chunk_end - chunk_start,
@@ -971,9 +989,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     seq_lens=chunk_seq_lens,
                     gather_lens=gather_lens[chunk_start:chunk_end],
                     swa_block_table=swa_block_table[chunk_start:chunk_end],
-                    query_start_loc=query_start_loc[
-                        num_decodes + chunk_start : num_decodes + chunk_end + 1
-                    ],
+                    query_start_loc=chunk_query_start_loc,
                     compressed_seq_lens=(
                         None
                         if compressed_block_table is None
@@ -984,6 +1000,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                         if compressed_block_table is None
                         else compressed_block_table[chunk_start:chunk_end]
                     ),
+                    block_req=block_req,
+                    block_qstart=block_qstart,
                 )
             )
 
@@ -1026,11 +1044,24 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         M = N + self.window_size + self.max_num_batched_tokens
 
+        # Query-blocked path for the ratio-128 layers: their combined index
+        # list is positional (identity prefix + sliding window), so the
+        # blocked kernel re-derives it instead of reading one. Multimodal
+        # steps keep the ragged path: image-local PrefixLM ranges extend the
+        # SWA segment beyond what the closed form reproduces.
+        block_m = 0
+        if (
+            not swa_only
+            and self.compress_ratio == 128
+            and swa_metadata.prefill_mm_query_ranges is None
+        ):
+            block_m = prefill_query_block_size(q.shape[1], q.shape[2])
+
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
             ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
         )[0]
-        for chunk in self._prefill_chunk_slices(attn_metadata, swa_metadata):
+        for chunk in self._prefill_chunk_slices(attn_metadata, swa_metadata, block_m):
             query_start = chunk.query_start
             query_end = chunk.query_end
             if not swa_only:
@@ -1059,6 +1090,35 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 offset=N,
                 use_fnuz=current_platform.is_fp8_fnuz(),
             )
+
+            if block_m > 0:
+                # Text-only ratio-128 chunk: the kernel re-derives the
+                # positional identity prefix and the sliding window, so no
+                # combined index list is built at all.
+                assert chunk.block_req is not None
+                assert chunk.block_qstart is not None
+                rocm_sparse_attn_prefill_blocked(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    block_req=chunk.block_req,
+                    block_qstart=chunk.block_qstart,
+                    query_start_loc=chunk.query_start_loc,
+                    seq_lens=chunk.seq_lens,
+                    gather_lens=chunk.gather_lens,
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    top_k=top_k,
+                    row_stride=M,
+                    swa_offset=N,
+                    compress_ratio=self.compress_ratio,
+                    window_size=self.window_size,
+                    block_m=block_m,
+                    output=output[query_start:query_end],
+                )
+                continue
 
             # Vision: image-local PrefixLM ranges widen the SWA segment of
             # multimodal queries, so they must be sliced per chunk and passed

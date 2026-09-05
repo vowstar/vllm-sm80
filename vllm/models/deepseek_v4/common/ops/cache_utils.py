@@ -232,10 +232,10 @@ def _dequantize_and_gather_k_kernel(
     k_cache_ptr,
     seq_lens_ptr,
     block_table_ptr,
-    block_table_stride,
     offset,
     gather_lens_ptr,
     # Constants
+    max_blocks_per_seq: tl.constexpr,
     fp8_dim: tl.constexpr,  # 448
     bf16_dim: tl.constexpr,  # 64
     scale_dim: tl.constexpr,  # 8
@@ -245,7 +245,7 @@ def _dequantize_and_gather_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded) int32
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
-    n_quant_blocks: tl.constexpr,  # 7 real blocks
+    fp8_block: tl.constexpr,  # fp8_dim rounded up to a power of two
     use_fnuz: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
@@ -269,7 +269,7 @@ def _dequantize_and_gather_k_kernel(
         pos_in_block = pos % cache_block_size
 
         # Get physical block index from block table
-        block_table_row_ptr = block_table_ptr + batch_idx * block_table_stride
+        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
         physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
 
         # int64: physical_block_idx * block_stride can exceed 2^31 with many
@@ -294,43 +294,39 @@ def _dequantize_and_gather_k_kernel(
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
+        # The quantization blocks tile fp8_dim exactly, so the whole fp8 range
+        # is one contiguous tile: issue it as a single wide load and gather
+        # each element's UE8M0 scale, rather than walking one dependent
+        # 64-wide load per block. This kernel is latency-bound (92%
+        # unallocated warps at 1% of DRAM), so round-trip count is what
+        # matters, not bytes.
+        fp8_offsets = tl.arange(0, fp8_block)
+        fp8_mask = fp8_offsets < fp8_dim
 
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
+        x_uint8 = tl.load(token_fp8_ptr + fp8_offsets, mask=fp8_mask, other=0)
+        # Decode fp8 bytes (FNUZ on gfx942, OCP elsewhere) to f32.
+        x_float = _decode_fp8_f32(x_uint8, use_fnuz)
 
-                # Load quantized fp8 values (stored as uint8)
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+        # UE8M0: scale = 2^(stored_value - 127), one scale per quant_block.
+        encoded_scale = tl.load(
+            token_scale_ptr + fp8_offsets // quant_block, mask=fp8_mask, other=127
+        )
+        scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
 
-                # Decode the raw byte to float32 in-register, for the same
-                # reason the encode side does: no fp8 dtype exists on sm_80.
-                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
-
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
-
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+        tl.store(
+            output_row_ptr + fp8_offsets,
+            (x_float * scale).to(tl.bfloat16),
+            mask=fp8_mask,
+        )
 
         # ========== Copy BF16 portion directly ==========
-        bf16_output_offset = fp8_dim  # After 448 elements in output
-
-        # Read bf16 from cache
+        # bf16_dim is a power of two, so this needs no mask.
+        bf16_offsets = tl.arange(0, bf16_dim)
         bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-
-        # Process in chunks of 16
-        for j in tl.static_range(bf16_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+        tl.store(
+            output_row_ptr + fp8_dim + bf16_offsets,
+            tl.load(bf16_cache_ptr + bf16_offsets),
+        )
 
 
 def dequantize_and_gather_k_cache_triton(
@@ -356,7 +352,13 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
-    NUM_WORKERS = 128
+    # The single wide fp8 tile below requires the quant blocks to tile fp8_dim
+    # exactly, so that the range is contiguous and every scale index is in bounds.
+    assert TOKEN_FP8_DIM % QUANT_BLOCK_SIZE == 0
+    # Workers stride over gather_len and carry no cross-worker state, so surplus
+    # workers simply run zero iterations. gather_len lives on the device, so
+    # sizing the grid from it would cost a host sync; over-provision instead.
+    NUM_WORKERS = 1024
     _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
         out,
         out.stride(0),
@@ -364,9 +366,9 @@ def dequantize_and_gather_k_cache_triton(
         k_cache,
         seq_lens,
         block_table,
-        block_table.stride(0),
         offset,
         gather_lens,
+        max_blocks_per_seq=block_table.shape[-1],
         fp8_dim=TOKEN_FP8_DIM,
         bf16_dim=TOKEN_BF16_DIM,
         scale_dim=TOKEN_SCALE_DIM,
@@ -376,7 +378,7 @@ def dequantize_and_gather_k_cache_triton(
         block_stride=k_cache.stride(0),
         output_dim=512,
         fp8_max=FP8_MAX,
-        n_quant_blocks=7,
+        fp8_block=triton.next_power_of_2(TOKEN_FP8_DIM),
         use_fnuz=use_fnuz,
     )
 
