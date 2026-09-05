@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
-    VLLM_SPARSE_DENSE_QUERY_BLOCK: int = -1
+    VLLM_SPARSE_DENSE_QUERY_BLOCK: int = 0
     VLLM_DSV4_SPLIT_K_DECODE: bool = True
     VLLM_DSV4_DECODE_FP8_LUT: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1084,9 +1084,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention layers: BLOCK_M consecutive queries share one CTA and run the
     # MMA at BLOCK_M * BLOCK_H rows, and each KV row is read once per block
     # instead of once per query. -1 auto-selects, 0 keeps every layer on the
-    # per-query kernel, >0 forces the tile.
+    # per-query kernel, >0 forces the tile. Default 0 (off): the kernel's
+    # first production run killed the engine at the first real prefill with
+    # the first-use-JIT/PP-timeout signature, and it is not covered by kernel
+    # warmup yet. Set -1 or a tile width to opt in.
     "VLLM_SPARSE_DENSE_QUERY_BLOCK": lambda: int(
-        os.environ.get("VLLM_SPARSE_DENSE_QUERY_BLOCK", "-1")
+        os.environ.get("VLLM_SPARSE_DENSE_QUERY_BLOCK", "0")
     ),
     # Route DSv4 sparse-attention decode through the split-K (flash-decode)
     # kernels on CUDA instead of the single-pass fallback. The single-pass
