@@ -50,11 +50,13 @@ That is the whole build. Nothing else in this repository is required.
 All three columns come from one harness against a live service with real
 technical prose as the prompt.
 
-**Benchmark convention.** From 2026-09-05 every DeepSeek benchmark is pipeline
-parallel 4 with layer partition `12,12,12,7` on four CMP 170HX 64 GB cards at
-PCIe Gen2 x16, so numbers stay comparable across hosts and over time. Each
-DeepSeek table names the topology it was measured on, and older PP5 numbers
-are marked historical rather than mixed into PP4 tables. The harness is
+**Benchmark convention.** From 2026-09-05, DeepSeek and Qwen benchmarks are
+pipeline parallel 4 with layer partition `12,12,12,7` on four CMP 170HX 64 GB
+cards at PCIe Gen2 x16, so numbers stay comparable across hosts and over
+time. GLM is benchmarked at its minimum viable topology PP5, because PP4
+does not fit on a 64 GiB CMP 170HX (see Known limits). Each DeepSeek table
+names the topology it was measured on, and older PP5 numbers are marked
+historical rather than mixed into PP4 tables. The harness is
 `performance_matrix_real.py`. Single-point decode numbers carry about ±20
 percent run-to-run noise from DSpark draft acceptance variance, so only a
 same-day same-harness A/B is exactly comparable. Concurrency tables quote
@@ -219,6 +221,10 @@ GLM 63.8 / 39.0 / 23.9 / 20.0 / 14.0, DeepSeek 78.1 / 61.6 / 40.3 / 28.3 /
 speculative decoding, but scales best (12.7x from 1 to 32 streams) because its
 GDN linear attention batches cheaply; GLM and DeepSeek scale about 6.5x.
 
+A newer Qwen PP4 run on the EPYC 7282 host (2026-09-06, after further warmup
+fixes) reaches 628.4 tok/s aggregate at 32 streams, 24 percent above the
+506.0 in the table above. The full ladder is in the Qwen section.
+
 **Two throughput numbers exist and they are not interchangeable.** Quoting one
 against the other is the most common way these figures get misread:
 
@@ -319,7 +325,7 @@ this fork's work.
 | Feature | State |
 | --- | --- |
 | PP4 serving | Works |
-| 1,000,000 token YaRN context | Works, from a native 262,144 |
+| 1,048,576 token YaRN context | Works, from a native 262,144 |
 | PLE CPU offload under PP | Works |
 | 8 concurrent streams | Works, 253 tok/s steady generation, cold prefix cache |
 | 16 concurrent streams | Works, 432 tok/s steady generation |
@@ -332,6 +338,34 @@ The PLE table is a 51 GB FP8 ngram embedding of 16 heads over a 20 million
 entry vocabulary, which is 51 of the model's 180 billion parameters. It stays in host memory and costs about microseconds per
 token, so it is not the decode bottleneck. It does need roughly 63 GB of host
 RAM for the whole container.
+
+PP4 on the EPYC 7282 host with the unified image, measured 2026-09-06: four
+CMP 170HX at Gen2 x16, a 20 GiB KV pin per rank, KV pool 3,337,985 tokens, a
+150 GiB CPU KV offload tier, and the full 1,048,576 token YaRN window. No
+speculative decoding. One stream, cold prompt:
+
+| Prompt tokens | Decode tok/s | TTFT |
+| ---: | ---: | ---: |
+| About 2 K | 36.1 | 0.9 s |
+| About 7 K | 34.8 | 1.4 s |
+| About 30 K | 36.2 | 2.7 s |
+| About 118 K | 36.9 | 7.5 s |
+| About 472 K | 38.1 | 29.4 s |
+
+| Streams | Aggregate tok/s | Per-request median tok/s |
+| ---: | ---: | ---: |
+| 1 | 36.2 | 36.9 |
+| 4 | 82.2 | 31.3 |
+| 8 | 234.8 | 30.2 |
+| 16 | 391.0 | 25.3 |
+| 32 | 628.4 | 20.5 |
+
+The decode curve is flat because GDN linear attention batches cheaply. The
+32-stream aggregate of 628.4 tok/s beats the 2026-09-02 same-host PP4 figure
+of 506.0 by 24 percent, thanks to the warmup and `do_not_specialize` fixes
+in between. Single-request decode reads about 36 tok/s on this EPYC 7282
+(Zen2) host against about 53 tok/s on the Ryzen 9 5900X host, because the
+PLE ngram lookup runs on the host CPU.
 
 Main changes for this model:
 
@@ -370,8 +404,21 @@ GLM-critical files, and production on the unified image confirms it. The
 smoke suite passes in full, vision and tool_choice included. MTP acceptance
 is 0.615. A 195 K prefix replays with 188,160 cached tokens on the first
 replay, a 45.5 s fill against a 5.7 s replay wall. At a 5.2 K prompt, TTFT
-is 3.49 s and decode runs 45.8 to 52.2 tok/s. GLM keeps PP5 11,9,9,9,7 as its
-production topology. The PP4 benchmark convention applies to DeepSeek only.
+is 3.49 s and decode runs 45.8 to 52.2 tok/s.
+
+GLM PP4 is not viable on a 64 GiB CMP 170HX, measured 2026-09-06 with three
+boot attempts. Util-derived KV sizing OOMs deterministically on rank 2:
+after the NVFP4 Marlin weights plus the MTP draft, 2.31 GiB is free against
+a 3.38 GiB profiling workspace ask. A 1.5 GiB KV pin per rank OOMs at the
+identical point. Dropping max-model-len to 262,144 was never reached,
+because the repeated OOM crashes escalated into a driver-level fault (NVRM
+Xid 154 on sibling cards, recovery action "OS Reboot", the known CMP 170HX
+plus driver 610.43.02 cascade family) and the launcher's own safeguard
+refused to continue. Recovery needed an nvidia module reload, and
+production (GLM PP5 and DeepSeek PP4) was fully restored afterwards. PP5
+11,9,9,9,7 is the minimum viable and production topology, so the GLM
+benchmark tables stay PP5-labeled as the documented exception to the PP4
+benchmark convention.
 
 Main changes for this model:
 
@@ -481,6 +528,7 @@ Settings that are easy to get wrong:
 | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` | Align it to the model's hybrid block size. DeepSeek uses 4096. GLM uses 143360 with fp8 KV and 73728 with bfloat16 KV. |
 | `VLLM_MARLIN_REPACK_HOLDOFF` | Avoids a load time MMU fault seen on CMP 170HX with driver 610.43.02. Set it to 0 elsewhere. |
 | `--kv-cache-memory` | GLM only. Stops Mamba state copies from evicting every hashed checkpoint when the default pool is too small. |
+| `--kv-cache-memory` for Qwen at PP4 | Keep it at or under about 20 GiB per rank. A 31 GiB pin crash-loops the engine at engine-init OOM. |
 | `--max-num-seqs` | For Qwen this is the real concurrency ceiling. Streams above it only queue. |
 | `VLLM_APC_HEADROOM_BLOCKS` | Keeps 32 blocks without hashes for state copies. Set it to 0 on tiny pools, including when running the prefix cache unit tests. |
 
@@ -507,7 +555,8 @@ Settings that are easy to get wrong:
 | Prefix cache tests | `tests/v1/core/test_prefix_caching.py` has 17 failures on this branch. Six come from the `VLLM_APC_HEADROOM_BLOCKS` default and clear at 0. The rest are unexplained and predate the current work. |
 | NIXL connector | `register_kv_caches` has undefined names left from a merge. Nothing here passes `--kv-transfer-config`. |
 | Blocked c128a prefill kernel | Ported with the split-K stack but default OFF (`VLLM_SPARSE_DENSE_QUERY_BLOCK=0`) pending a warmup fix. Its first live run hung the engine, the current hypothesis being first-use Triton JIT inside a pipeline collective. |
-| Qwen on the unified image | Config-aligned but not yet boot-verified. It differs from its last verified image only by the six DeepSeek-scoped commits. |
+| GLM PP4 | Tested 2026-09-06 and impossible on a 64 GiB CMP 170HX with MTP enabled. Util-derived KV sizing and a 1.5 GiB pin per rank both OOM on rank 2 during profiling (2.31 GiB free against a 3.38 GiB workspace ask), and repeated attempts escalated to a driver fault that needed a module reload. PP5 11,9,9,9,7 is the minimum viable and production topology. |
+| Qwen KV pin at PP4 | Must not exceed about 20 GiB per rank. A 31 GiB pin crash-loops the engine at engine-init OOM. |
 
 ## Attribution
 
