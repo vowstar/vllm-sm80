@@ -406,6 +406,37 @@ is 0.615. A 195 K prefix replays with 188,160 cached tokens on the first
 replay, a 45.5 s fill against a 5.7 s replay wall. At a 5.2 K prompt, TTFT
 is 3.49 s and decode runs 45.8 to 52.2 tok/s.
 
+PP5 on the EPYC 7282 (Zen2) host with the unified image, measured 2026-09-06
+against the live production service: PP5 11,9,9,9,7 on five CMP 170HX at
+Gen2 x16, fp8 KV, MTP x3, max-model-len 1,048,576, KV pool 6,670,108
+tokens. One stream, cold prompt:
+
+| Prompt tokens | Decode tok/s | TTFT |
+| ---: | ---: | ---: |
+| 1,845 | 52.3 | 1.39 s |
+| 7,381 | 46.3 | 4.68 s |
+| 29,519 | 46.5 | 8.98 s |
+| 117,991 | 46.6 | 27.9 s |
+| 471,870 | 44.8 | 115.9 s |
+| 943,742 | 49.2 | 263.3 s |
+
+| Streams | Aggregate tok/s | Per-request median tok/s |
+| ---: | ---: | ---: |
+| 1 | 56.5 | 61.1 |
+| 4 | 117.7 | 36.8 |
+| 8 | 210.4 | 32.6 |
+| 16 | 257.1 | 18.9 |
+| 32 | 341.1 | 13.0 |
+
+The decode curve is flat at about 45 to 52 tok/s from 2 K to 1 M. Older GLM
+figures in this document (decode about 66 to 74 tok/s, 32-stream aggregate
+about 433 tok/s) came from different host hardware and the pre-unification
+image, so they are historical and not comparable point for point. A same-day
+same-host spot check, old image 54.0 against unified 45.8 to 52.2 tok/s at a
+5.2 K prompt, reads as parity inside measurement noise, so the delta against
+the older tables is attributed to the host change, not to the unified
+image.
+
 GLM PP4 is not viable on a 64 GiB CMP 170HX, measured 2026-09-06 with three
 boot attempts. Util-derived KV sizing OOMs deterministically on rank 2:
 after the NVFP4 Marlin weights plus the MTP draft, 2.31 GiB is free against
