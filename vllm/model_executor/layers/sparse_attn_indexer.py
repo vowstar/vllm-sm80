@@ -54,8 +54,9 @@ MXFP4_BLOCK_SIZE = 32
 # Row-chunk the prefill logits transient. The [M, N] float32 logits buffer is
 # the indexer's largest allocation and grows with context; on the last PP rank
 # it is what exhausts the device at long context. Each row's top-k reads only
-# its own [ks, ke), so blocking over rows is exact.
-_DSV4_LOGITS_ROW_CHUNK = int(os.environ.get("DSV4_LOGITS_ROW_CHUNK", "0"))
+# its own [ks, ke), so blocking over rows is exact. Default 128 rows (the
+# wtdcode fork's measured value; our deployments overrode to 64 via the env).
+_DSV4_LOGITS_ROW_CHUNK = int(os.environ.get("DSV4_LOGITS_ROW_CHUNK", "128"))
 
 
 def _top_k_per_row_prefill_torch(

@@ -48,6 +48,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.visibility import get_max_image_swa_width
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -364,6 +365,68 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 k_cache_prefix=self.prefix,
             )
 
+        # Built after weight loading by `fuse_input_gemm_weights`; see there.
+        self.fused_input_weight: torch.Tensor | None = None
+        self.fused_input_splits: list[int] = []
+
+    # NOTE: upstream sm80 round-2 fuses input GEMMs via a
+    # process_weights_after_loading loader hook; this fork keeps the original
+    # call site in nvidia/model.py instead. Defining the hook here as well
+    # made the fusion run twice, which measured as an ~8% single-stream
+    # decode regression on 4xA6000 TP4 -- do not re-add it without removing
+    # the model.py call.
+
+    def fuse_input_gemm_weights(self) -> None:
+        """Concatenate the three bf16 input projections into one weight.
+
+        `_run_parallel_input_projections` runs four GEMMs off the same
+        hidden_states. Three of them are unquantized and read the same x, so
+        one GEMM over the concatenated weight does the same work with a third
+        of the launches and a third of the x traffic. Measured per layer on
+        A100 with rotated (L2-cold) weights, us:
+
+            M          1      6      8     64    2048
+            separate  31.6   38.5   38.9   41.1  345.9
+            merged    20.2   21.0   21.0   22.9  213.6
+
+        i.e. -14 us/layer at batch-1 decode (x21 ratio-4 layers = -0.30 ms of
+        a ~10.9 ms step) and -132 us/layer on a 2048-token prefill chunk.
+
+        The three weights become views into the concatenated buffer, so the
+        only lasting allocation is the copy that replaces them; the originals
+        drop with their last reference. Nothing else has to change, because a
+        row-slice of a contiguous [N, K] tensor is itself contiguous.
+        """
+        if self.compressor is None or self.indexer is None:
+            # Only the ratio-4 layers carry all three; the others have one
+            # input GEMM and nothing to merge.
+            return
+        if not current_platform.is_cuda():
+            # The merged GEMM hands `weights_proj` to the indexer as fp32
+            # instead of bf16. The Triton indexer-q kernel casts to fp32 on
+            # entry either way (fused_indexer_q.py:169), but the XPU op
+            # documents a bf16 input (_xpu_ops.py:396), so platforms other
+            # than CUDA keep the three-GEMM path until measured there.
+            return
+        parts = [
+            self.compressor.fused_wkv_wgate.weight,
+            self.indexer.compressor.fused_wkv_wgate.weight,
+            self.indexer.weights_proj.weight,
+        ]
+        if any(
+            w is None or w.dtype != torch.bfloat16 or w.shape[1] != self.hidden_size
+            for w in parts
+        ):
+            return
+        merged = torch.cat([w.detach() for w in parts], dim=0).contiguous()
+        splits = [w.shape[0] for w in parts]
+        offset = 0
+        for w, n in zip(parts, splits):
+            w.data = merged[offset : offset + n]
+            offset += n
+        self.fused_input_weight = merged
+        self.fused_input_splits = splits
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -573,6 +636,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+
+        if self.fused_input_weight is not None:
+            # One GEMM for all three (see fuse_input_gemm_weights). It occupies
+            # a single aux slot, so the other two stay None and nothing waits on
+            # events that were never recorded.
+            merged_w = self.fused_input_weight
+            splits = self.fused_input_splits
+
+            def merged_input_gemm() -> torch.Tensor:
+                # cuBLAS at every M; the CTA-per-row Triton GEMV wins only at
+                # M=1 here, not worth a second shape-specific gate.
+                return torch.mm(hidden_states, merged_w.T, out_dtype=torch.float32)
+
+            aux_fns[0] = merged_input_gemm
+            qr_kv, (merged_out, _, _) = execute_in_parallel(
+                lambda: self._fused_wqa_wkv_gemm(hidden_states),
+                aux_fns,
+                self.ln_events[0],
+                self.ln_events[1:4],
+                aux_streams,
+                enable=hidden_states.shape[0]
+                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            )
+            kv_score, indexer_kv_score, indexer_weights = merged_out.split(
+                splits, dim=-1
+            )
+            # weights_proj used to round through bf16 here; the merged GEMM
+            # accumulates in fp32 and the consumer casts to fp32 anyway
+            # (fused_indexer_q.py:169), so this is the more precise of the two.
+            return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type for mypy.

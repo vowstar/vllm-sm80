@@ -2035,8 +2035,13 @@ class DeepseekV4ForCausalLM(
         )
 
     def process_weights_after_loading(self) -> None:
+        # Model-level post-load hook: runs for every loader, including
+        # DummyModelLoader, which never calls load_weights().
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4Attention):
+                module.fuse_input_gemm_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
