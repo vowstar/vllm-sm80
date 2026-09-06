@@ -10,12 +10,15 @@ driver 610.43.02. Other sm_80 GPUs such as A100 are not tested.
 
 | Model | State | Tested layout |
 | --- | --- | --- |
-| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 or 5 cards, PP4 or PP5, 1M context, vision, DSpark x3, fp8_ds_mla KV, split-K decode |
+| DeepSeek-V4-Flash-Vision-Exp | Serving, measured | 4 cards, PP4 (12,12,12,7), 1M context, vision, DSpark x3, fp8_ds_mla KV, split-K decode LUT |
 | Qwen3.8-Flash-Next-FP8 | Serving, measured | 4 cards, PP4, 1M YaRN context, PLE CPU offload |
 | GLM-5.3-Flash | Serving, measured | 5 cards, PP5, 1M context, vision, MTP x3, fp8 KV |
 
 DeepSeek-V4-Flash-0731, the text only checkpoint, also loads and answers on
 this branch. It was validated at 64K context without speculative decoding.
+
+Since 2026-09-05 one image, `vllm-sm80:unified-84e5971d2a` built from `main`
+at `84e5971d2a`, backs every model on both GPU hosts.
 
 ## Hardware
 
@@ -47,6 +50,18 @@ That is the whole build. Nothing else in this repository is required.
 All three columns come from one harness against a live service with real
 technical prose as the prompt.
 
+**Benchmark convention.** From 2026-09-05 every DeepSeek benchmark is pipeline
+parallel 4 with layer partition `12,12,12,7` on four CMP 170HX 64 GB cards at
+PCIe Gen2 x16, so numbers stay comparable across hosts and over time. Each
+DeepSeek table names the topology it was measured on, and older PP5 numbers
+are marked historical rather than mixed into PP4 tables. The harness is
+`performance_matrix_real.py`. Single-point decode numbers carry about ±20
+percent run-to-run noise from DSpark draft acceptance variance, so only a
+same-day same-harness A/B is exactly comparable. Concurrency tables quote
+aggregate throughput, which charges time to first token and pipeline fill
+against the result. The steady generation rate, defined further down,
+excludes both.
+
 Use real prose. A prompt built from one repeated word makes speculative
 decoding accept almost everything at short context and almost nothing at long
 context, which turns a flat curve into a cliff. The same DeepSeek service
@@ -56,7 +71,8 @@ measured 101 tok/s at 2 K and 29 tok/s at 1 M on a repeated word prompt, and
 ### Decode speed against context length
 
 One stream, cold prompt, no prefix cache hit. Time to first token is the full
-prefill.
+prefill. Topologies in this table: DeepSeek PP4 on the EPYC 7282 host, Qwen
+PP4 on the Ryzen 9 5900X host, GLM PP5.
 
 | Prompt tokens | DeepSeek tok/s | Qwen tok/s | GLM tok/s |
 | ---: | ---: | ---: | ---: |
@@ -84,6 +100,40 @@ part of their short context advantage is draft acceptance rather than step
 time. The GLM column uses fp8 KV, the production default, so it decodes a few
 tokens per second slower than the same model with bfloat16 KV; the comparison
 table below quantifies the gap.
+
+### Unified image on both hosts (2026-09-05)
+
+DeepSeek-V4-Flash-Vision-Exp on `vllm-sm80:unified-84e5971d2a`, PP4
+12,12,12,7, DSpark x3, fp8_ds_mla KV with the split-K decode LUT. Host A has
+an EPYC 7282, host B has a Ryzen 9 5900X, and both run four CMP 170HX 64 GB
+cards at Gen2 x16. Same harness, same day, one stream, cold prompt.
+
+| Prompt tokens | Host A tok/s | Host B tok/s |
+| ---: | ---: | ---: |
+| About 2 K | 61.3 | |
+| About 30 K | 94.0 | 100.8 |
+| About 120 K | 72.0 | |
+| About 480 K | 88.5 | 61.6 |
+
+| Streams | Host A aggregate | Host B aggregate |
+| ---: | ---: | ---: |
+| 1 | 71.6 tok/s | |
+| 16 | 364.7 tok/s | 310.8 tok/s |
+
+Host B also ran its previous image the same day, which isolates the image
+change on one machine:
+
+| Measurement | Old image | Unified image |
+| --- | ---: | ---: |
+| Decode at about 30 K | 75.8 tok/s | 100.8 tok/s |
+| Decode at about 120 K | 53.1 tok/s | |
+| Decode at about 480 K | 45.9 tok/s | 61.6 tok/s |
+| 16 streams aggregate | 249.7 tok/s | 310.8 tok/s |
+
+Host A ran the same A/B in the same campaign. Decode at about 120 K went
+from 51.7 to 84.1 tok/s and at about 480 K from 43.4 to 88.5 tok/s, roughly
+double at long context. Each single point still carries the ±20 percent
+acceptance noise from the convention note above.
 
 ### Prefill
 
@@ -149,11 +199,11 @@ production stays on bfloat16 KV.
 
 ### Throughput against concurrency
 
-The three models run different topologies (DeepSeek PP4 and PP5, Qwen PP4,
-GLM PP5) and different true-concurrency caps (`--max-num-seqs`), so one
-"streams" count does not mean the same work per model. One harness, 512 output
-tokens, about 1,600-token prose prompts with unique prefixes, against each live
-service:
+The three models run different topologies (in this table DeepSeek is PP4,
+Qwen PP4, GLM PP5) and different true-concurrency caps (`--max-num-seqs`), so
+one "streams" count does not mean the same work per model. One harness, 512
+output tokens, about 1,600-token prose prompts with unique prefixes, against
+each live service:
 
 | Concurrency | Qwen aggregate | Qwen steady | GLM aggregate | DeepSeek aggregate |
 | --- | ---: | ---: | ---: | ---: |
@@ -228,9 +278,23 @@ The Vision checkpoint is `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
 | 1,048,576 token context | Works |
 | Image input | Works, checked against a generated test image |
 | DSpark speculative decoding under PP | Works |
-| Prefix caching | Works |
+| Prefix caching | Works, 99.7 percent replay after the unified cutover |
 | Tool calls and the `deepseek_v4` parser | Works, checked with a function call |
 | KV offload | Present, not exercised here |
+
+Production on both hosts runs `vllm-sm80:unified-84e5971d2a`, built from
+`main` at `84e5971d2a`, at PP4 with partition `12,12,12,7`, DSpark x3, and
+fp8_ds_mla KV with the split-K decode LUT. The KV pool is 2,674,615 tokens on
+the EPYC host and 2,396,420 tokens on the Ryzen host, that is 2.55x and 2.29x
+concurrent 1M-token requests. After the cutover on the Ryzen host, factual QA
+passed and a prefix replay cached 102,144 of 102,441 prompt tokens (99.7
+percent) with the replay wall dropping from 21.2 s to 0.5 s. The two hosts
+use different docker graph drivers, so cross-host image acceptance compares
+the 30 RootFS diff_ids, not the image ID.
+
+The text-only 0731 checkpoint on the same PP4 layout with the LUT build:
+82.5 tok/s decode at about 120 K prompt tokens, 67.8 tok/s at about 480 K,
+377.8 tok/s aggregate at 32 streams, mean DSpark acceptance length 3.35.
 
 Main changes for this model:
 
@@ -300,6 +364,14 @@ FP8 KV against bfloat16 KV on the same system:
 | Decode with a 1 M prefix | About 71 tok/s | About 77 tok/s |
 | Cold prefill at 1 M | About 305 s | About 173 s |
 | Needle recall at 128 K, 512 K, and 1 M | All pass | All pass |
+
+Unified image validation, 2026-09-05: the DeepSeek merge changed zero
+GLM-critical files, and production on the unified image confirms it. The
+smoke suite passes in full, vision and tool_choice included. MTP acceptance
+is 0.615. A 195 K prefix replays with 188,160 cached tokens on the first
+replay, a 45.5 s fill against a 5.7 s replay wall. At a 5.2 K prompt, TTFT
+is 3.49 s and decode runs 45.8 to 52.2 tok/s. GLM keeps PP5 11,9,9,9,7 as its
+production topology. The PP4 benchmark convention applies to DeepSeek only.
 
 Main changes for this model:
 
@@ -434,6 +506,8 @@ Settings that are easy to get wrong:
 | No peer to peer | These cards stage GPU to GPU through host RAM at about 3 GB/s, so never use tensor parallelism. |
 | Prefix cache tests | `tests/v1/core/test_prefix_caching.py` has 17 failures on this branch. Six come from the `VLLM_APC_HEADROOM_BLOCKS` default and clear at 0. The rest are unexplained and predate the current work. |
 | NIXL connector | `register_kv_caches` has undefined names left from a merge. Nothing here passes `--kv-transfer-config`. |
+| Blocked c128a prefill kernel | Ported with the split-K stack but default OFF (`VLLM_SPARSE_DENSE_QUERY_BLOCK=0`) pending a warmup fix. Its first live run hung the engine, the current hypothesis being first-use Triton JIT inside a pipeline collective. |
+| Qwen on the unified image | Config-aligned but not yet boot-verified. It differs from its last verified image only by the six DeepSeek-scoped commits. |
 
 ## Attribution
 
@@ -454,6 +528,10 @@ table.
 
 One active branch, `main`. Pre consolidation tips are kept as
 `archive/*-20260901` tags.
+
+2026-09-05: `wtd-merge-20260905` merged into `main` at `84e5971d2a`. One
+image now backs every model on both GPU hosts, and the PP4 DeepSeek
+benchmark convention took effect.
 
 This is a personal production fork. When upstream vLLM provides equivalent
 sm_80 support, this repository will point at the upstream implementation.
