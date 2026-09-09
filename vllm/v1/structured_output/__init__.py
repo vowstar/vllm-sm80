@@ -4,7 +4,8 @@ import itertools
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from copy import copy
+from typing import TYPE_CHECKING, overload
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -31,6 +32,34 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+class _TokenSequenceView(Sequence[int]):
+    """Read-only concatenation that does not copy committed token history."""
+
+    def __init__(self, prefix: Sequence[int], suffix: Sequence[int]) -> None:
+        self.prefix = prefix
+        self.suffix = suffix
+
+    def __len__(self) -> int:
+        return len(self.prefix) + len(self.suffix)
+
+    @overload
+    def __getitem__(self, index: int) -> int: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[int]: ...
+
+    def __getitem__(self, index: int | slice) -> int | list[int]:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        if index < len(self.prefix):
+            return self.prefix[index]
+        return self.suffix[index - len(self.prefix)]
 
 
 class StructuredOutputManager:
@@ -297,6 +326,7 @@ class StructuredOutputManager:
 
                 state_advancements = 0
                 post_reasoning_end_in_window = False
+                post_reasoning_prefix_valid = True
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
@@ -327,9 +357,24 @@ class StructuredOutputManager:
                             post_reasoning_end_in_window = True
                     if advance_grammar and not grammar.is_terminated():
                         if post_reasoning_end_in_window:
-                            accepted = bool(grammar.validate_tokens([token]))
-                            if accepted:
-                                accepted = grammar.accept_tokens(req_id, [token])
+                            # These drafts were produced before the grammar
+                            # became active. Probe without logging an expected
+                            # rejection, then persist only valid transitions.
+                            # Once one draft is rejected, the speculative
+                            # suffix is unreachable and must not be probed
+                            # against a state that omitted that draft.
+                            accepted = post_reasoning_prefix_valid and (
+                                grammar.validate_tokens([token]) == [token]
+                            )
+                            if not accepted:
+                                post_reasoning_prefix_valid = False
+                            elif not grammar.accept_tokens(req_id, [token]):
+                                # Validation is non-advancing. If the same
+                                # transition cannot then be persisted, fail
+                                # closed rather than hiding inconsistent state.
+                                raise AssertionError(
+                                    (token, req_id, scheduled_spec_decode_tokens)
+                                )
                         else:
                             accepted = grammar.accept_tokens(req_id, [token])
                         if accepted:
@@ -497,6 +542,106 @@ class StructuredOutputManager:
         if num_reasoning <= 0:
             return new_token_ids
         return new_token_ids[num_reasoning:]
+
+    @staticmethod
+    def _find_reasoning_end_offset(
+        reasoner: "ReasoningParser",
+        prior_token_ids: Sequence[int],
+        new_token_ids: list[int],
+    ) -> int | None:
+        """Return where a reasoning-end marker completes in a sampled block.
+
+        The first parser call keeps reasoning-only blocks at one check. When
+        the block contains a transition, cumulative delta prefixes locate
+        single-token and multi-token markers, including markers that start in
+        ``prior_token_ids`` and finish in ``new_token_ids``.
+
+        Args:
+            reasoner: Request-scoped parser that identifies the transition.
+            prior_token_ids: Tokens committed before the sampled block.
+            new_token_ids: Accepted tokens awaiting commit.
+
+        Returns:
+            The zero-based offset where the marker completes, or ``None`` if
+            the sampled block remains inside reasoning.
+        """
+        complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
+        if not copy(reasoner).is_reasoning_end_streaming(
+            complete_tokens, new_token_ids
+        ):
+            return None
+
+        for offset in range(len(new_token_ids)):
+            delta_ids = new_token_ids[: offset + 1]
+            token_ids = _TokenSequenceView(prior_token_ids, delta_ids)
+            # Streaming parsers may retain request-local transition state.
+            # A probe must not consume that state before the normal commit path.
+            if copy(reasoner).is_reasoning_end_streaming(token_ids, delta_ids):
+                return offset
+
+        # Some parsers report only that the complete block crossed a boundary.
+        # Treating the full block as reasoning avoids exposing an unknown suffix
+        # to the answer grammar.
+        return len(new_token_ids) - 1
+
+    def filter_speculative_grammar_tokens(
+        self,
+        request: "Request",
+        new_token_ids: list[int],
+    ) -> tuple[list[int], int]:
+        """Validate an accepted speculative block before it is committed.
+
+        Grammar masks cover scheduled draft positions, but an accepted block
+        can contain an unconstrained token immediately after a reasoning
+        transition or after the grammar completes. The filter retains the
+        grammar-valid prefix and reports the trailing tokens that must be
+        resampled. ``validate_tokens`` restores the grammar state before
+        returning, so the scheduler's normal commit path remains the only
+        operation that advances the matcher.
+
+        Args:
+            request: Request that owns the grammar and reasoning state.
+            new_token_ids: Accepted tokens awaiting scheduler commit.
+
+        Returns:
+            The tokens that are safe to commit and the rejected suffix length.
+        """
+        if self.vllm_config.speculative_config is None:
+            return new_token_ids, 0
+        if len(new_token_ids) < 2 or not request.use_structured_output:
+            return new_token_ids, 0
+
+        structured_request = request.structured_output_request
+        if structured_request is None:
+            return new_token_ids, 0
+        grammar = structured_request.grammar
+        if not isinstance(grammar, StructuredOutputGrammar):
+            return new_token_ids, 0
+
+        reasoner = self._get_reasoner(request)
+        grammar_start = 0
+        if (
+            reasoner is not None
+            and not self.enable_in_reasoning
+            and not structured_request.reasoning_ended
+        ):
+            boundary = self._find_reasoning_end_offset(
+                reasoner,
+                request.all_token_ids,
+                new_token_ids,
+            )
+            if boundary is None:
+                return new_token_ids, 0
+            grammar_start = boundary + 1
+
+        grammar_tokens = new_token_ids[grammar_start:]
+        if not grammar_tokens:
+            return new_token_ids, 0
+        valid_grammar_tokens = grammar.validate_tokens(grammar_tokens)
+        rejected = len(grammar_tokens) - len(valid_grammar_tokens)
+        if rejected == 0:
+            return new_token_ids, 0
+        return new_token_ids[:grammar_start] + valid_grammar_tokens, rejected
 
     def clear_backend(self) -> None:
         if self.backend is not None:

@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """grammar_bitmask under spec-decode draft padding (#44006)."""
 
+from collections.abc import Iterable, Sequence
+from typing import overload
+from unittest.mock import Mock
+
 import pytest
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.reasoning.step3p5_reasoning_parser import Step3p5ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -189,7 +194,9 @@ def test_bitmask_constrained_when_reasoning_ends_midwindow(backend):
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
-def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend, caplog):
+def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(
+    backend, caplog, monkeypatch
+):
     """Post-marker drafts predate the bitmask and may be grammar-invalid;
     grammar_bitmask must skip the grammar advance instead of asserting.
     """
@@ -221,7 +228,24 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend, caplog)
     # A token that the JSON grammar would reject as the first post-marker
     # token; without the fix grammar.accept_tokens fires the assertion.
     invalid_post = tokenizer.encode("z")[0]
-    drafts = [pre, marker, invalid_post]
+    unreachable_post = tokenizer.encode('"')[0]
+    drafts = [pre, marker, invalid_post, unreachable_post]
+
+    validate_calls = []
+    accept_calls = []
+    original_validate = grammar.validate_tokens
+    original_accept = grammar.accept_tokens
+
+    def validate_spy(tokens):
+        validate_calls.append(list(tokens))
+        return original_validate(tokens)
+
+    def accept_spy(req_id, tokens):
+        accept_calls.append((req_id, list(tokens)))
+        return original_accept(req_id, tokens)
+
+    monkeypatch.setattr(grammar, "validate_tokens", validate_spy)
+    monkeypatch.setattr(grammar, "accept_tokens", accept_spy)
 
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
@@ -235,7 +259,94 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend, caplog)
     assert not (bitmask[2] == -1).all()
     # Grammar must not have advanced through the unvalidated draft.
     assert not grammar.is_terminated()
+    assert validate_calls == [[invalid_post]]
+    assert accept_calls == []
     assert "Failed to advance FSM" not in caplog.text
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_bitmask_valid_post_reasoning_draft_advances_then_rolls_back(
+    backend, caplog, monkeypatch
+):
+    """A valid post-marker draft is persisted for the next bitmask row, then
+    rolled back so repeated scheduler probes remain idempotent.
+    """
+    tokenizer, manager, request, _ = _make_manager_and_request(backend, prompt_str="{")
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, tokenizer.encode("{"))
+    processed_before = getattr(grammar, "num_processed_tokens", None)
+
+    marker = tokenizer.encode("\n")[0]
+    manager.reasoner_cls = _MarkerReasoner
+    request.structured_output_request.reasoner = _MarkerReasoner(marker)
+    request.structured_output_request.reasoning_ended = False
+
+    valid_post = tokenizer.encode('"')[0]
+    drafts = [tokenizer.encode(" ")[0], marker, valid_post]
+    validate_calls = []
+    accept_calls = []
+    original_validate = grammar.validate_tokens
+    original_accept = grammar.accept_tokens
+
+    def validate_spy(tokens):
+        validate_calls.append(list(tokens))
+        return original_validate(tokens)
+
+    def accept_spy(req_id, tokens):
+        accept_calls.append((req_id, list(tokens)))
+        return original_accept(req_id, tokens)
+
+    monkeypatch.setattr(grammar, "validate_tokens", validate_spy)
+    monkeypatch.setattr(grammar, "accept_tokens", accept_spy)
+
+    first = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: drafts},
+    )
+    second = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: drafts},
+    )
+
+    assert first is not None and second is not None
+    assert (first == second).all()
+    assert validate_calls == [[valid_post], [valid_post]]
+    assert accept_calls == [
+        (request.request_id, [valid_post]),
+        (request.request_id, [valid_post]),
+    ]
+    if processed_before is not None:
+        assert grammar.num_processed_tokens == processed_before
+    assert not grammar.is_terminated()
+    assert "Failed to advance FSM" not in caplog.text
+
+
+def test_bitmask_post_reasoning_validation_accept_mismatch_fails_closed(monkeypatch):
+    """A backend state mismatch is not an expected speculative rejection."""
+    tokenizer, manager, request, _ = _make_manager_and_request(
+        "xgrammar", prompt_str="{"
+    )
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, tokenizer.encode("{"))
+
+    marker = tokenizer.encode("\n")[0]
+    manager.reasoner_cls = _MarkerReasoner
+    request.structured_output_request.reasoner = _MarkerReasoner(marker)
+    request.structured_output_request.reasoning_ended = False
+    post = tokenizer.encode('"')[0]
+    drafts = [tokenizer.encode(" ")[0], marker, post]
+
+    monkeypatch.setattr(grammar, "validate_tokens", lambda tokens: list(tokens))
+    monkeypatch.setattr(grammar, "accept_tokens", lambda req_id, tokens: False)
+
+    with pytest.raises(AssertionError):
+        manager.grammar_bitmask(
+            requests={request.request_id: request},
+            structured_output_request_ids=[request.request_id],
+            scheduled_spec_decode_tokens={request.request_id: drafts},
+        )
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
@@ -390,3 +501,154 @@ def test_trim_reasoning_for_advance():
     next_step = [post, post]
     request.append_output_token_ids(next_step)
     assert manager.trim_reasoning_for_advance(request, next_step) == next_step
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_speculative_grammar_filter_rejects_invalid_boundary_suffix(backend):
+    """Only the grammar-valid answer prefix may cross the commit boundary."""
+    tokenizer, manager, request, _, marker = _setup_boundary_request(backend)
+    reasoning_token = tokenizer.encode(" ")[0]
+    valid_answer_token = tokenizer.encode("{")[0]
+    invalid_answer_token = tokenizer.encode("z")[0]
+    sampled_tokens = [
+        reasoning_token,
+        marker,
+        valid_answer_token,
+        invalid_answer_token,
+    ]
+
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, sampled_tokens
+    )
+
+    assert filtered == [reasoning_token, marker, valid_answer_token]
+    assert rejected == 1
+    grammar = request.structured_output_request.grammar
+    assert grammar.validate_tokens([valid_answer_token]) == [valid_answer_token]
+
+
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_speculative_grammar_filter_rejects_tokens_after_completion(backend):
+    """A sampled block cannot commit tokens past a completed grammar value."""
+    tokenizer, manager, request, _, _ = _setup_boundary_request(backend)
+    request.structured_output_request.reasoning_ended = True
+    complete_object = tokenizer.encode("{}")
+    invalid_suffix = tokenizer.encode("z")[0]
+
+    filtered, rejected = manager.filter_speculative_grammar_tokens(
+        request, [*complete_object, invalid_suffix]
+    )
+
+    assert filtered == complete_object
+    assert rejected == 1
+
+
+def test_reasoning_boundary_scan_does_not_copy_committed_history():
+    """Boundary detection can expose long history without materializing it."""
+    parser_calls = 0
+
+    class TokenHistory(Sequence[int]):
+        def __len__(self) -> int:
+            return 300_000
+
+        @overload
+        def __getitem__(self, index: int) -> int: ...
+
+        @overload
+        def __getitem__(self, index: slice) -> list[int]: ...
+
+        def __getitem__(self, index: int | slice) -> int | list[int]:
+            raise AssertionError("committed token history was materialized")
+
+    class EndTokenReasoner:
+        def is_reasoning_end_streaming(
+            self, input_ids: Sequence[int], delta_ids: Iterable[int]
+        ) -> bool:
+            nonlocal parser_calls
+            parser_calls += 1
+            assert len(input_ids) >= 300_000
+            return 99 in delta_ids
+
+    reasoner = EndTokenReasoner()
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        reasoner, TokenHistory(), [10, 99, 20]
+    )
+
+    assert boundary == 1
+    assert parser_calls == 3
+
+
+def test_reasoning_boundary_scan_checks_nontransition_block_once():
+    """A sampled block without a transition requires one parser call."""
+    parser_calls = 0
+
+    class NoBoundaryReasoner:
+        def is_reasoning_end_streaming(
+            self, input_ids: Sequence[int], delta_ids: Iterable[int]
+        ) -> bool:
+            nonlocal parser_calls
+            parser_calls += 1
+            return False
+
+    reasoner = NoBoundaryReasoner()
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        reasoner, [1, 2, 3], [10, 20, 30]
+    )
+
+    assert boundary is None
+    assert parser_calls == 1
+
+
+def test_reasoning_boundary_scan_preserves_stateful_parser():
+    """Pre-commit probing must not consume Step3.5's pending transition."""
+    tokenizer = Mock()
+    tokenizer.get_vocab.return_value = {"<think>": 1, "</think>": 2}
+    reasoner = Step3p5ReasoningParser(tokenizer)
+    reasoner._end_token_pending = True
+
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        reasoner, [1, 2, 3], [10, 20]
+    )
+
+    assert boundary == 0
+    assert reasoner._end_token_pending
+
+
+def test_reasoning_boundary_scan_locates_multi_token_marker():
+    """A parser that examines cumulative deltas locates a multi-token marker."""
+
+    class MultiTokenReasoner:
+        def is_reasoning_end_streaming(
+            self, input_ids: Sequence[int], delta_ids: Iterable[int]
+        ) -> bool:
+            delta = list(delta_ids)
+            return any(
+                delta[index : index + 2] == [20, 30] for index in range(len(delta) - 1)
+            )
+
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        MultiTokenReasoner(), [1, 2, 3], [20, 30, 40]
+    )
+
+    assert boundary == 1
+
+
+def test_reasoning_boundary_scan_handles_marker_across_blocks():
+    """A multi-token marker may start in history and finish in the new block."""
+
+    class CrossBlockReasoner:
+        def is_reasoning_end_streaming(
+            self, input_ids: Sequence[int], delta_ids: Iterable[int]
+        ) -> bool:
+            tokens = list(input_ids)
+            delta_len = len(list(delta_ids))
+            return any(
+                tokens[index : index + 3] == [7, 8, 9]
+                for index in range(max(0, len(tokens) - delta_len - 2), len(tokens))
+            )
+
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        CrossBlockReasoner(), [1, 7, 8], [9, 10]
+    )
+
+    assert boundary == 0
