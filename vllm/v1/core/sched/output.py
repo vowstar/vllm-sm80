@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -268,6 +268,12 @@ class SchedulerOutput:
 
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
+
+    # Structured-output requests whose scheduled spec tokens still hold -1
+    # placeholders (draft hand-off miss, vllm#54437) or grammar-invalidated
+    # padding. The worker must not verify genuine GPU drafts at those rows:
+    # their grammar bitmask rows are permissive by construction.
+    spec_drafts_invalid_req_ids: set[str] = field(default_factory=set)
 
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None

@@ -1328,6 +1328,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
 
+        # vllm#54437 fail-closed: poison GPU-resident drafts at positions the
+        # scheduler still holds as -1 placeholders (or grammar-invalidated
+        # padding), so acceptance cannot pass the last row with a real grammar
+        # mask. The proposer rewrites these rows every step.
+        invalid_spec_req_ids = scheduler_output.spec_drafts_invalid_req_ids
+        if invalid_spec_req_ids and draft_tokens:
+            for b, req_id in enumerate(req_ids):
+                if req_id not in invalid_spec_req_ids:
+                    continue
+                sched_ids = draft_tokens.get(req_id)
+                if not sched_ids:
+                    continue
+                first_invalid = sched_ids.index(-1)
+                self.req_states.draft_tokens[idx_mapping_np[b], first_invalid:] = -1
+
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
         logits_indices = combine_sampled_and_draft_tokens(
