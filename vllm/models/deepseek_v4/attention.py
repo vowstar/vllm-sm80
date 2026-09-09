@@ -186,6 +186,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        skip_topk: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -286,6 +287,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.topk_indices_buffer = topk_indices_buffer
 
         self.indexer = None
+        # IndexCache: an S layer reuses the topk_indices a previous c4a layer
+        # wrote into the shared buffer this forward, so its own indexer never
+        # runs. Refer: https://arxiv.org/abs/2603.12201
+        self.skip_topk = skip_topk
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
@@ -305,6 +310,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                skip_topk=skip_topk,
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -916,11 +922,13 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        skip_topk: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
+        self.skip_topk = skip_topk
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -1025,6 +1033,12 @@ class DeepseekV4Indexer(nn.Module):
         rotary_emb: nn.Module,
         qr_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        # IndexCache S layer: reuse the topk_indices already in the shared
+        # buffer. Returning Nones makes _sparse_indexer_and_attn skip
+        # indexer_op, same convention as the short-context path below. The
+        # main-attention compressor is separate and still runs.
+        if self.skip_topk:
+            return None, None, None
         compressor = self.compressor
 
         attn_metadata = get_forward_context().attn_metadata

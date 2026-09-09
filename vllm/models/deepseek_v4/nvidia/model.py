@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -1127,6 +1128,57 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _indexcache_skip_layers(
+    config,
+    start_layer: int,
+    end_layer: int,
+) -> frozenset[int]:
+    """Return the c4a layers that reuse topk instead of recomputing it.
+
+    Refer: https://arxiv.org/abs/2603.12201 (IndexCache). Mirrors the V3.2
+    config knobs in deepseek_v2.py (use_index_cache / index_topk_freq /
+    index_topk_pattern / index_skip_topk_offset), but counts the c4a
+    sequence within this PP rank's [start_layer, end_layer) range: the
+    topk_indices_buffer is private to each rank, so the first local c4a
+    layer must always be F or later S layers would read stale indices
+    written by a previous forward.
+    """
+    if not getattr(config, "use_index_cache", False):
+        return frozenset()
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    freq = getattr(config, "index_topk_freq", 1)
+    pattern = getattr(config, "index_topk_pattern", None)
+    offset = getattr(config, "index_skip_topk_offset", 2)
+    skip: set[int] = set()
+    pattern_str = ""
+    seq_idx = 0
+    for layer_id in range(start_layer, end_layer):
+        if layer_id >= len(compress_ratios) or compress_ratios[layer_id] != 4:
+            continue
+        if pattern is None:
+            # seq_idx 0 is always F: it is this rank's first writer of the
+            # shared buffer, independent of freq and offset.
+            is_skip = seq_idx > 0 and max(seq_idx - offset + 1, 0) % freq != 0
+        else:
+            assert pattern[0] == "F", "index_topk_pattern must start with 'F'"
+            is_skip = seq_idx < len(pattern) and pattern[seq_idx] == "S"
+        pattern_str += "S" if is_skip else "F"
+        if is_skip:
+            skip.add(layer_id)
+        seq_idx += 1
+    if seq_idx:
+        logger.info(
+            "IndexCache c4a pattern for layers [%d, %d): %s "
+            "(%d of %d c4a layers reuse topk)",
+            start_layer,
+            end_layer,
+            pattern_str,
+            len(skip),
+            seq_idx,
+        )
+    return frozenset(skip)
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1134,6 +1186,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        skip_topk_layers: frozenset[int] = frozenset(),
     ):
         super().__init__()
 
@@ -1147,6 +1200,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            skip_topk=extract_layer_index(prefix) in skip_topk_layers,
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
@@ -1340,6 +1394,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dtype=torch.int32,
         )
 
+        # IndexCache skip set for this PP rank, computed with the same
+        # partition make_layers will use below.
+        skip_topk_layers = _indexcache_skip_layers(
+            config,
+            *get_pp_indices(
+                config.num_hidden_layers,
+                get_pp_group().rank_in_group,
+                get_pp_group().world_size,
+            ),
+        )
+
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -1357,6 +1422,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                skip_topk_layers=skip_topk_layers,
             ),
             prefix=f"{prefix}.layers",
         )
