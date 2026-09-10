@@ -2483,19 +2483,6 @@ class Scheduler(SchedulerInterface):
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
-        # vllm#54437 fail-closed: a structured-output request whose scheduled
-        # spec tokens still contain -1 (hand-off miss or grammar padding)
-        # must not have genuine GPU drafts verified at those rows; their
-        # grammar bitmask rows are permissive by construction.
-        for req_id, spec_token_ids in sched_spec_tokens.items():
-            request = self.requests.get(req_id)
-            if (
-                request is not None
-                and request.use_structured_output
-                and -1 in spec_token_ids
-            ):
-                scheduler_output.spec_drafts_invalid_req_ids.add(req_id)
-
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
