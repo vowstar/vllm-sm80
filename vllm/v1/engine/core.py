@@ -744,7 +744,14 @@ class EngineCore:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
             if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
+                # vllm#54437 part 2: ask for the snapshot belonging to the
+                # step being sampled, by step id, instead of whatever
+                # microbatch ran last. A miss returns None and the step's
+                # placeholders survive, which the fail-closed path
+                # (num_acceptable_drafts) treats as an invalid window.
+                draft_token_ids = self.model_executor.take_draft_token_ids(
+                    deferred_scheduler_output.step_id
+                )
                 if draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to
                     # filter out the invalid spec tokens, which will be padded

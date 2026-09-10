@@ -175,6 +175,46 @@ from vllm.v1.worker.workspace import use_workspace_lane
 logger = init_logger(__name__)
 
 
+def grammar_invalid_draft_positions(
+    input_batch: InputBatch,
+    grammar_req_ids: list[str],
+    num_acceptable_drafts: list[int] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Entries of the gathered draft vector that must not be accepted.
+
+    A structured-output request's bitmask rows past the first -1 placeholder
+    carry the all-permissive `_full_mask`, so the drafts verified there must
+    be rejected or the request samples with no grammar constraint. Drafts
+    0..num_acceptable-1 were visible to the bitmask builder and may be
+    accepted; draft num_acceptable is the first whose acceptance would
+    advance sampling into an unconstrained row. Port of vllm#54442.
+
+    Returns indices into `draft_sampled`, which is gathered through
+    `logits_indices` and read one position ahead of its logits row, or None
+    when there is nothing to invalidate.
+    """
+    if not grammar_req_ids or input_batch.num_draft_tokens == 0:
+        return None
+    cu_num_logits = input_batch.cu_num_logits_np.tolist()
+    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
+    positions: list[int] = []
+    for i, req_id in enumerate(grammar_req_ids):
+        req_idx = req_id_to_idx.get(req_id)
+        if req_idx is None:
+            continue
+        # Without the field (an older scheduler, or warmup) fall back to
+        # invalidating the whole window, which is the conservative choice.
+        num_acceptable = (
+            num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0
+        )
+        start = cu_num_logits[req_idx] + 1 + num_acceptable
+        positions.extend(range(start, cu_num_logits[req_idx + 1]))
+    if not positions:
+        return None
+    return torch.tensor(positions, dtype=torch.int64, device=device)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1353,11 +1393,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
-
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.
@@ -1386,7 +1421,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
-            max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
@@ -1462,6 +1496,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
+        invalid_draft_positions = None
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1470,6 +1505,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output.structured_output_request_ids,
                 grammar_output.grammar_bitmask,
+            )
+            invalid_draft_positions = grammar_invalid_draft_positions(
+                input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.num_acceptable_drafts,
+                self.device,
             )
 
         sampler_output: SamplerOutput | None
@@ -1489,6 +1530,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+                invalid_draft_positions,
             )
 
         if shard_metadata is not None:
@@ -1864,6 +1906,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            step_id=scheduler_output.step_id,
         )
 
         if not self.is_last_pp_rank:
@@ -2026,6 +2069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                step_id=self.execute_model_state.step_id,
             )
 
         # Post-step KV connector related operations.
@@ -2035,8 +2079,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         return async_output
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.draft_tokens_handler.get_draft_tokens()
+    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
+        return self.draft_tokens_handler.get_draft_tokens(step_id)
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -2169,6 +2213,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
+    step_id: int = 0
 
 
 class BatchReqState(NamedTuple):

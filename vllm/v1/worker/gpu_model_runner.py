@@ -5195,7 +5195,9 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
+        # step_id is ignored: step-tagged snapshots are an MRv2 fix
+        # (vllm#54437 part 2); the legacy runner keeps single-slot semantics.
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()

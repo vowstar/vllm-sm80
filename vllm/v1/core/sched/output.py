@@ -295,6 +295,12 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # The scheduler's step counter at schedule() time. vllm#54437 part 2:
+    # identifies this batch so the worker's draft-token snapshots can be
+    # matched to the exact step the engine is sampling, instead of whatever
+    # microbatch ran last under PP + async scheduling.
+    step_id: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -316,3 +322,15 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # vllm#54442: per request, ordered as structured_output_request_ids, how
+    # many leading draft tokens were still real when the bitmask was built --
+    # the index of the first -1 placeholder in scheduled_spec_decode_tokens,
+    # or the window length if there is none.
+    #
+    # `grammar_bitmask` fills row i before inspecting token i, so with the
+    # first -1 at index j rows 0..j hold a real mask and rows j+1.. hold the
+    # all-permissive `_full_mask`. Drafts 0..j-1 may be accepted; draft j
+    # onward must not be, because accepting one advances sampling into an
+    # unconstrained row. None means there are no speculative tokens to
+    # invalidate.
+    num_acceptable_drafts: list[int] | None = None

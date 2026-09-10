@@ -74,6 +74,26 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def compute_num_acceptable_drafts(
+    structured_output_request_ids: list[str],
+    scheduled_spec_decode_tokens: dict[str, list[int]],
+) -> list[int]:
+    """Mirror, per request, where `grammar_bitmask` stopped producing real masks.
+
+    See `GrammarOutput.num_acceptable_drafts`. Port of vllm#54442.
+    """
+    num_acceptable_drafts: list[int] = []
+    for req_id in structured_output_request_ids:
+        req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
+        num_valid = len(req_tokens)
+        for i, token in enumerate(req_tokens):
+            if token == -1:
+                num_valid = i
+                break
+        num_acceptable_drafts.append(num_valid)
+    return num_acceptable_drafts
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1425,6 +1445,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            step_id=self.current_step,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1868,7 +1889,13 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        num_acceptable_drafts = compute_num_acceptable_drafts(
+            structured_output_request_ids,
+            scheduler_output.scheduled_spec_decode_tokens,
+        )
+        return GrammarOutput(
+            structured_output_request_ids, bitmask, num_acceptable_drafts
+        )
 
     def update_from_output(
         self,
