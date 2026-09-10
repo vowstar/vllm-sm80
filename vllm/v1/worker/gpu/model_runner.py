@@ -1932,6 +1932,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        step_id = self.execute_model_state.step_id
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2069,7 +2070,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
-                step_id=self.execute_model_state.step_id,
+                step_id=step_id,
             )
 
         # Post-step KV connector related operations.
