@@ -267,7 +267,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
+            ql_nope, q_pe = q
+            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+                # NoPE model (GLM-5.3-Flash): the cat would copy ql_nope onto
+                # itself through the slow CatArrayBatchedCopy path.
+                q = ql_nope
+            else:
+                q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
 

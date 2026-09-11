@@ -259,11 +259,12 @@ class Glm5NextMoE(nn.Module):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # The router is always external (self.gate); main's MoERunner expects
-        # pre-computed router_logits, so compute them here unconditionally.
-        router_logits, _ = self.gate(hidden_states)
+        # MoERunner holds the gate (passed to FusedMoEFactory) and recomputes
+        # the router logits itself (moe_runner.py, `if self.gate is not None`),
+        # overwriting whatever is passed in, so computing them here was a dead
+        # bf16->fp32 GEMM per MoE layer.  Pass the placeholder DeepseekV4 uses.
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=hidden_states
         )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
