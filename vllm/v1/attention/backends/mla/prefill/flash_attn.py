@@ -327,6 +327,15 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
                 qk_rope_head_dim=64,
                 v_head_dim=128,
             ),
+            # GLM5Next NoPE layout: qk_head_dim 256 + 0 and v_head_dim 256 run
+            # the same kernels as the (192, 64, 256) layout.  Verified on sm_80:
+            # flash_attn_varlen_func with head_dim 256, bf16, 64 heads matches a
+            # fp32 reference to 2e-3 relative (FA2).
+            MLADimensions(
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                v_head_dim=256,
+            ),
         ]
 
     def __init__(
